@@ -22,7 +22,7 @@ def inicio():
 def obtener_ruta_asignada(conductor: str = Query(...), dia: str = Query(...)):
     try:
         # ✅ Ruta correcta al archivo Excel
-        df = pd.read_excel("datos/base_datos_todos_con_coordenadas.xlsx")
+        df = pd.read_excel("datos/base_datos_todos_con_coordenadas.csv")
 
         # Limpieza de columnas y nombres
         df.columns = df.columns.str.strip().str.lower()
