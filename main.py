@@ -1,71 +1,45 @@
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import pandas as pd
 
 app = FastAPI()
 
-# Configurar CORS para permitir conexión desde cualquier origen
+# Permitir acceso desde cualquier origen
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Ruta raíz de prueba
 @app.get("/")
-def root():
+def read_root():
     return {"message": "API AguaRuta funcionando correctamente"}
 
-# Ruta para obtener entregas por conductor y día
 @app.get("/ruta-asignada")
-def obtener_ruta_asignada(conductor: str = Query(...), dia: str = Query(...)):
+def get_ruta_asignada(conductor: str = Query(...), dia: str = Query(...)):
     try:
-        df = pd.read_excel("base_datos_todos_con_coordenadas.xlsx")
+        # Lee el archivo Excel desde la carpeta /data
+        df = pd.read_excel("data/base_datos_todos_con_coordenadas.xlsx")
 
-        # Normalizar nombres de columnas
+        # Normaliza nombres de columnas para evitar errores
         df.columns = [col.strip().lower() for col in df.columns]
 
-        # Filtrar por conductor y día
-        conductor_rutas = df[
-            (df["conductor"] == conductor) & (df["dia"] == dia)
+        # Filtra por conductor y día
+        datos_filtrados = df[
+            (df["conductor"].str.upper() == conductor.upper()) &
+            (df["dia"].str.upper() == dia.upper())
         ]
 
-        resultados = []
-        for _, row in conductor_rutas.iterrows():
-            resultados.append({
-                "camion": row["id camión"],
-                "dia": row["dia"],
-                "litros": row["litros de entrega"],
-                "latitud": row["latitud"],
-                "longitud": row["longitud"]
-            })
+        # Selecciona columnas útiles
+        resultado = datos_filtrados[["camion", "dia", "litros", "latitud", "longitud"]].to_dict(orient="records")
+        return resultado
 
-        return resultados
-
+    except FileNotFoundError:
+        return JSONResponse(content={"error": "No se encuentra el archivo Excel"}, status_code=500)
+    except KeyError as e:
+        return JSONResponse(content={"error": f"Columna faltante: {str(e)}"}, status_code=500)
     except Exception as e:
-        return {"error": str(e)}
-
-# Ruta adicional si se requiere por camión
-@app.get("/rutas-por-camion")
-def obtener_rutas_por_camion(camion: str = Query(...)):
-    try:
-        df = pd.read_excel("base_datos_todos_con_coordenadas.xlsx")
-        df.columns = [col.strip().lower() for col in df.columns]
-
-        data = df[df["id camión"] == camion]
-
-        resultados = []
-        for _, row in data.iterrows():
-            resultados.append({
-                "nombre": row["nombre (jefe de hogar)"],
-                "dia": row["dia"],
-                "litros": row["litros de entrega"],
-                "latitud": row["latitud"],
-                "longitud": row["longitud"]
-            })
-
-        return resultados
-
-    except Exception as e:
-        return {"error": str(e)}
+        return JSONResponse(content={"error": str(e)}, status_code=500)
