@@ -1,11 +1,11 @@
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 import pandas as pd
+import uvicorn
 
 app = FastAPI()
 
-# Permitir acceso desde cualquier origen
+# Configuración de CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -15,31 +15,33 @@ app.add_middleware(
 )
 
 @app.get("/")
-def read_root():
+def inicio():
     return {"message": "API AguaRuta funcionando correctamente"}
 
 @app.get("/ruta-asignada")
-def get_ruta_asignada(conductor: str = Query(...), dia: str = Query(...)):
+def obtener_ruta_asignada(conductor: str = Query(...), dia: str = Query(...)):
     try:
-        # Lee el archivo Excel desde la carpeta /data
-        df = pd.read_excel("data/base_datos_todos_con_coordenadas.xlsx")
+        # ✅ Ruta correcta al archivo Excel
+        df = pd.read_excel("datos/base_datos_todos_con_coordenadas.xlsx")
 
-        # Normaliza nombres de columnas para evitar errores
-        df.columns = [col.strip().lower() for col in df.columns]
+        # Limpieza de columnas y nombres
+        df.columns = df.columns.str.strip().str.lower()
+        conductor = conductor.strip().lower()
+        dia = dia.strip().lower()
 
-        # Filtra por conductor y día
-        datos_filtrados = df[
-            (df["conductor"].str.upper() == conductor.upper()) &
-            (df["dia"].str.upper() == dia.upper())
+        # Verificación de columnas requeridas
+        if "conductor" not in df.columns or "dia_asignado" not in df.columns:
+            return {"error": "Faltan columnas necesarias en el archivo Excel"}
+
+        # Filtrar según el conductor y día
+        resultados = df[
+            (df["conductor"].str.lower().str.strip() == conductor) &
+            (df["dia_asignado"].str.lower().str.strip() == dia)
         ]
 
-        # Selecciona columnas útiles
-        resultado = datos_filtrados[["camion", "dia", "litros", "latitud", "longitud"]].to_dict(orient="records")
-        return resultado
-
-    except FileNotFoundError:
-        return JSONResponse(content={"error": "No se encuentra el archivo Excel"}, status_code=500)
-    except KeyError as e:
-        return JSONResponse(content={"error": f"Columna faltante: {str(e)}"}, status_code=500)
+        return resultados.to_dict(orient="records")
     except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        return {"error": str(e)}
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=10000)
