@@ -1,54 +1,71 @@
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
-from typing import Optional
-import os
 
 app = FastAPI()
 
-# CORS para conexión desde app móvil o frontend
+# Configurar CORS para permitir conexión desde cualquier origen
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Puedes restringir en producción
-    allow_credentials=True,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Ruta correcta al archivo oficial de AguaRuta
-DATA_FILE = os.path.join("data", "base_datos_todos_con_coordenadas.xlsx")
-
+# Ruta raíz de prueba
 @app.get("/")
 def root():
     return {"message": "API AguaRuta funcionando correctamente"}
 
-# ✅ Rutas filtradas por conductor y día (ajustado a columnas reales)
+# Ruta para obtener entregas por conductor y día
 @app.get("/ruta-asignada")
-def get_ruta_asignada(conductor: str = Query(...), dia: str = Query(...)):
+def obtener_ruta_asignada(conductor: str = Query(...), dia: str = Query(...)):
     try:
-        df = pd.read_excel(DATA_FILE)
+        df = pd.read_excel("base_datos_todos_con_coordenadas.xlsx")
 
-        # Normaliza nombres de columnas a minúsculas sin espacios
-        df.columns = df.columns.str.strip().str.lower()
+        # Normalizar nombres de columnas
+        df.columns = [col.strip().lower() for col in df.columns]
 
-        df['conductor'] = df['conductor'].astype(str).str.strip().str.lower()
-        df['dia_asignado'] = df['dia_asignado'].astype(str).str.strip().str.lower()
-
-        rutas = df[
-            (df['conductor'] == conductor.strip().lower()) &
-            (df['dia_asignado'] == dia.strip().lower())
+        # Filtrar por conductor y día
+        conductor_rutas = df[
+            (df["conductor"] == conductor) & (df["dia"] == dia)
         ]
 
-        return rutas.to_dict(orient="records")
+        resultados = []
+        for _, row in conductor_rutas.iterrows():
+            resultados.append({
+                "camion": row["id camión"],
+                "dia": row["dia"],
+                "litros": row["litros de entrega"],
+                "latitud": row["latitud"],
+                "longitud": row["longitud"]
+            })
+
+        return resultados
+
     except Exception as e:
         return {"error": str(e)}
 
-# ✅ Todas las rutas (sin filtro, útil para mostrar por camión, mapa, etc.)
+# Ruta adicional si se requiere por camión
 @app.get("/rutas-por-camion")
-def get_rutas_por_camion():
+def obtener_rutas_por_camion(camion: str = Query(...)):
     try:
-        df = pd.read_excel(DATA_FILE)
-        df.columns = df.columns.str.strip().str.lower()
-        return df.to_dict(orient="records")
+        df = pd.read_excel("base_datos_todos_con_coordenadas.xlsx")
+        df.columns = [col.strip().lower() for col in df.columns]
+
+        data = df[df["id camión"] == camion]
+
+        resultados = []
+        for _, row in data.iterrows():
+            resultados.append({
+                "nombre": row["nombre (jefe de hogar)"],
+                "dia": row["dia"],
+                "litros": row["litros de entrega"],
+                "latitud": row["latitud"],
+                "longitud": row["longitud"]
+            })
+
+        return resultados
+
     except Exception as e:
         return {"error": str(e)}
