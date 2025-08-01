@@ -110,5 +110,42 @@ async def editar_redistribucion(request: Request):
         return {"mensaje": "Redistribución actualizada correctamente"}
     except Exception as e:
         return {"error": str(e)}
+import psycopg2
+from psycopg2 import sql
 
-# Puedes seguir agregando endpoints aquí (registrar entrega, registrar punto, etc.)
+def crear_tablas_si_no_existen():
+    conn = psycopg2.connect("postgresql://aguaruta_db_user:u1JUg0dcbEYzzzoF8N4lsbdZ6c2ZXyPb@dpg-d25b5mripnbc73dpod0g-a.oregon-postgres.render.com/aguaruta_db")
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS ruta_activa (
+            id SERIAL PRIMARY KEY,
+            camion TEXT,
+            nombre TEXT,
+            dia TEXT,
+            litros INTEGER,
+            telefono TEXT,
+            latitud DOUBLE PRECISION,
+            longitud DOUBLE PRECISION
+        );
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS redistribucion (
+            id SERIAL PRIMARY KEY,
+            camion TEXT,
+            nombre TEXT,
+            dia TEXT,
+            litros INTEGER,
+            telefono TEXT,
+            latitud DOUBLE PRECISION,
+            longitud DOUBLE PRECISION
+        );
+    """)
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+crear_tablas_si_no_existen()
+
