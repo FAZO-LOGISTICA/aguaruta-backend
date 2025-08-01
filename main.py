@@ -1,7 +1,6 @@
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-import pandas as pd
-import os
+import psycopg2
 
 app = FastAPI()
 
@@ -13,36 +12,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-EXCEL_PATH = "data/base_datos_todos_con_coordenadas.xlsx"
-REDIST_PATH = "data/redistribucion.xlsx"
+# Configuración de la base de datos
+DB_URL = "postgresql://aguaruta_db_user:u1JUg0dcbEYzzzoF8N4lsbdZ6c2ZXyPb@dpg-d25b5mripnbc73dpod0g-a.oregon-postgres.render.com/aguaruta_db"
 
-# 1. RUTAS ACTIVAS
+def get_connection():
+    return psycopg2.connect(DB_URL)
+
+# RUTAS ACTIVAS
 
 @app.get("/rutas-activas")
 def obtener_rutas_activas():
     try:
-        df = pd.read_excel(EXCEL_PATH)
-        columnas_requeridas = [
-            'id camión', 'nombre (jefe de hogar)', 'latitud', 'longitud',
-            'litros de entrega', 'dia'
-        ]
-        for col in columnas_requeridas:
-            if col not in df.columns:
-                return {"error": f"Falta columna requerida: {col}"}
-        rutas = []
-        for _, row in df.iterrows():
-            if pd.notnull(row["latitud"]) and pd.notnull(row["longitud"]):
-                ruta = {
-                    "camion": row["id camión"],
-                    "nombre": row["nombre (jefe de hogar)"],
-                    "latitud": row["latitud"],
-                    "longitud": row["longitud"],
-                    "litros": row["litros de entrega"],
-                    "dia_asignado": row["dia"],
-                }
-                if "telefono" in df.columns and pd.notnull(row["telefono"]):
-                    ruta["telefono"] = row["telefono"]
-                rutas.append(ruta)
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT camion, nombre, latitud, longitud, litros, dia, telefono FROM ruta_activa")
+        filas = cur.fetchall()
+        columnas = [desc[0] for desc in cur.description]
+        rutas = [dict(zip(columnas, fila)) for fila in filas]
+        cur.close()
+        conn.close()
         return rutas
     except Exception as e:
         return {"error": str(e)}
@@ -51,37 +39,51 @@ def obtener_rutas_activas():
 async def editar_ruta(request: Request):
     try:
         data = await request.json()
-        df = pd.read_excel(EXCEL_PATH)
-        index = df[df["nombre (jefe de hogar)"] == data["nombre"]].index
-        if len(index) == 0:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM ruta_activa WHERE nombre = %s", (data["nombre"],))
+        row = cur.fetchone()
+        if not row:
             return {"error": "No se encontró el registro"}
-        i = index[0]
-        df.at[i, "id camión"] = data.get("camion", df.at[i, "id camión"])
-        df.at[i, "litros de entrega"] = data.get("litros", df.at[i, "litros de entrega"])
-        df.at[i, "dia"] = data.get("dia_asignado", df.at[i, "dia"])
-        if "telefono" in data:
-            df.at[i, "telefono"] = data.get("telefono", df.at[i, "telefono"])
-        df.at[i, "latitud"] = data.get("latitud", df.at[i, "latitud"])
-        df.at[i, "longitud"] = data.get("longitud", df.at[i, "longitud"])
-        df.to_excel(EXCEL_PATH, index=False)
+        id_ruta = row[0]
+        cur.execute("""
+            UPDATE ruta_activa SET
+                camion = %s,
+                litros = %s,
+                dia = %s,
+                telefono = %s,
+                latitud = %s,
+                longitud = %s
+            WHERE id = %s
+        """, (
+            data.get("camion"),
+            data.get("litros"),
+            data.get("dia_asignado"),
+            data.get("telefono"),
+            data.get("latitud"),
+            data.get("longitud"),
+            id_ruta
+        ))
+        conn.commit()
+        cur.close()
+        conn.close()
         return {"mensaje": "Ruta actualizada correctamente"}
     except Exception as e:
         return {"error": str(e)}
 
-# 2. REDISTRIBUCIÓN
+# REDISTRIBUCIÓN
 
 @app.get("/redistribucion")
 def obtener_redistribucion():
     try:
-        if not os.path.exists(REDIST_PATH):
-            return []
-        df = pd.read_excel(REDIST_PATH)
-        # Aquí ajusta los nombres según tus columnas reales:
-        columnas = df.columns.tolist()
-        data = []
-        for _, row in df.iterrows():
-            fila = {col: row[col] for col in columnas}
-            data.append(fila)
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT camion, nombre, dia, litros, telefono, latitud, longitud FROM redistribucion")
+        filas = cur.fetchall()
+        columnas = [desc[0] for desc in cur.description]
+        data = [dict(zip(columnas, fila)) for fila in filas]
+        cur.close()
+        conn.close()
         return data
     except Exception as e:
         return {"error": str(e)}
@@ -90,62 +92,34 @@ def obtener_redistribucion():
 async def editar_redistribucion(request: Request):
     try:
         data = await request.json()
-        df = pd.read_excel(REDIST_PATH)
-        # Editar por nombre, cambia la clave si tu columna de ID es otra:
-        index = df[df["nombre (jefe de hogar)"] == data["nombre"]].index
-        if len(index) == 0:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM redistribucion WHERE nombre = %s", (data["nombre"],))
+        row = cur.fetchone()
+        if not row:
             return {"error": "No se encontró el registro"}
-        i = index[0]
-        # Actualiza lo que corresponda, agrega o cambia columnas según tus datos:
-        if "nuevo_camion" in data:
-            df.at[i, "nuevo camión"] = data.get("nuevo_camion", df.at[i, "nuevo camión"])
-        if "nuevo_litros" in data:
-            df.at[i, "litros de entrega"] = data.get("nuevo_litros", df.at[i, "litros de entrega"])
-        if "dia" in data:
-            df.at[i, "dia"] = data.get("dia", df.at[i, "dia"])
-        if "telefono" in data:
-            df.at[i, "telefono"] = data.get("telefono", df.at[i, "telefono"])
-        # Puedes agregar más campos según tus columnas
-        df.to_excel(REDIST_PATH, index=False)
+        id_redist = row[0]
+        cur.execute("""
+            UPDATE redistribucion SET
+                camion = %s,
+                litros = %s,
+                dia = %s,
+                telefono = %s,
+                latitud = %s,
+                longitud = %s
+            WHERE id = %s
+        """, (
+            data.get("nuevo_camion"),
+            data.get("nuevo_litros"),
+            data.get("dia"),
+            data.get("telefono"),
+            data.get("latitud"),
+            data.get("longitud"),
+            id_redist
+        ))
+        conn.commit()
+        cur.close()
+        conn.close()
         return {"mensaje": "Redistribución actualizada correctamente"}
     except Exception as e:
         return {"error": str(e)}
-import psycopg2
-from psycopg2 import sql
-
-def crear_tablas_si_no_existen():
-    conn = psycopg2.connect("postgresql://aguaruta_db_user:u1JUg0dcbEYzzzoF8N4lsbdZ6c2ZXyPb@dpg-d25b5mripnbc73dpod0g-a.oregon-postgres.render.com/aguaruta_db")
-    cur = conn.cursor()
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS ruta_activa (
-            id SERIAL PRIMARY KEY,
-            camion TEXT,
-            nombre TEXT,
-            dia TEXT,
-            litros INTEGER,
-            telefono TEXT,
-            latitud DOUBLE PRECISION,
-            longitud DOUBLE PRECISION
-        );
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS redistribucion (
-            id SERIAL PRIMARY KEY,
-            camion TEXT,
-            nombre TEXT,
-            dia TEXT,
-            litros INTEGER,
-            telefono TEXT,
-            latitud DOUBLE PRECISION,
-            longitud DOUBLE PRECISION
-        );
-    """)
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
-crear_tablas_si_no_existen()
-
