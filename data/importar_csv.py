@@ -1,56 +1,59 @@
 import pandas as pd
 import psycopg2
 
-# Conexión a tu base de datos
 DB_URL = "postgresql://aguaruta_db_user:u1JUg0dcbEYzzzoF8N4lsbdZ6c2ZXyPb@dpg-d25b5mripnbc73dpod0g-a.oregon-postgres.render.com/aguaruta_db"
-
-# Carga del CSV
 csv_file = "base_datos_todos_con_coordenadas.csv"
+
+# Columnas que tu base espera (ajusta si cambian)
+expected_columns = ["camion", "nombre", "latitud", "longitud", "litros", "dia", "telefono"]
+
+# Cargar CSV
 df = pd.read_csv(csv_file)
 
-# Limpieza de nombres de columnas (quitar espacios al inicio/fin)
-df.columns = [col.strip().replace('\n', ' ').replace('\r', '') for col in df.columns]
+# Normalizar nombres de columnas para evitar errores por espacios
+df.columns = [col.strip().lower().replace(" ", "_").replace("(jefe_de_hogar)", "nombre") for col in df.columns]
 
-# Mapear nombres de columnas del CSV a la tabla ruta_activa
-col_map = {
-    'id camión': 'camion',
-    'conductor': 'nombre',
-    'dia': 'dia',
-    'telefono': 'telefono',
-    'latitud': 'latitud',
-    'longitud': 'longitud',
-    'litros de entrega': 'litros'
-    # Puedes agregar aquí más mapeos si lo deseas
+# Renombrar columnas del CSV para que coincidan con las de la base de datos
+rename_map = {
+    "id_camión": "camion",
+    "conductor": "nombre",  # O ajusta según tu estructura
+    "nombre_(jefe_de_hogar)": "nombre",
+    "nombre": "nombre",
+    "dia": "dia",
+    "telefono": "telefono",
+    "latitud": "latitud",
+    "longitud": "longitud",
+    "litros_de_entrega": "litros",
+    "litros": "litros"
 }
 
-# Solo usar las columnas que existen en el CSV y en la base de datos
-cols_db = ['camion', 'nombre', 'dia', 'telefono', 'latitud', 'longitud', 'litros']
+df = df.rename(columns=rename_map)
 
-# Prepara los datos para insertar
-rows_to_insert = []
-for _, row in df.iterrows():
-    values = []
-    for col in cols_db:
-        # Obtiene el valor del CSV usando el mapeo, si no está deja None
-        csv_col = [k for k, v in col_map.items() if v == col]
-        val = row[csv_col[0]] if csv_col and csv_col[0] in row else None
-        values.append(val)
-    # Inserta aunque haya columnas vacías
-    rows_to_insert.append(tuple(values))
+# Solo columnas relevantes
+df = df[[col for col in expected_columns if col in df.columns]]
 
-# Inserción en la base de datos
+# Conexión a la base
 conn = psycopg2.connect(DB_URL)
 cur = conn.cursor()
 
-# OPCIONAL: Borra la tabla antes de cargar nuevos datos
-# cur.execute("TRUNCATE TABLE ruta_activa RESTART IDENTITY;")
-# conn.commit()
+for idx, row in df.iterrows():
+    # Si toda la fila está vacía, ignorar
+    if row.isnull().all():
+        continue
 
-for row in rows_to_insert:
+    # Insertar, permitiendo valores nulos
     cur.execute("""
-        INSERT INTO ruta_activa (camion, nombre, dia, telefono, latitud, longitud, litros)
+        INSERT INTO ruta_activa (camion, nombre, latitud, longitud, litros, dia, telefono)
         VALUES (%s, %s, %s, %s, %s, %s, %s)
-    """, row)
+    """, (
+        row.get("camion"),
+        row.get("nombre"),
+        row.get("latitud"),
+        row.get("longitud"),
+        row.get("litros"),
+        row.get("dia"),
+        row.get("telefono")
+    ))
 
 conn.commit()
 cur.close()
