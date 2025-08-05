@@ -123,3 +123,31 @@ async def editar_redistribucion(request: Request):
         return {"mensaje": "Redistribución actualizada correctamente"}
     except Exception as e:
         return {"error": str(e)}
+        from fastapi.responses import StreamingResponse
+import pandas as pd
+import io
+
+@app.get("/exportar-excel")
+def exportar_excel():
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT camion, nombre, latitud, longitud, litros, dia, telefono FROM ruta_activa")
+        filas = cur.fetchall()
+        columnas = [desc[0] for desc in cur.description]
+        cur.close()
+        conn.close()
+        # Pandas DataFrame
+        df = pd.DataFrame(filas, columns=columnas)
+        # Excel en memoria
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+            df.to_excel(writer, index=False, sheet_name="Rutas")
+        output.seek(0)
+        headers = {
+            'Content-Disposition': 'attachment; filename="rutas_activas.xlsx"'
+        }
+        return StreamingResponse(output, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers=headers)
+    except Exception as e:
+        return {"error": str(e)}
+
