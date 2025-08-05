@@ -150,4 +150,18 @@ def exportar_excel():
         return StreamingResponse(output, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers=headers)
     except Exception as e:
         return {"error": str(e)}
-
+        @app.delete("/eliminar-ficticio")
+def eliminar_ficticio():
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            DELETE FROM ruta_activa
+            WHERE nombre = 'Juan Pérez' OR telefono = '123456789'
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+        return {"mensaje": "Registro ficticio eliminado"}
+    except Exception as e:
+        return {"error": str(e)}
