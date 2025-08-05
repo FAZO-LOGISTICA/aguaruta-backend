@@ -1,6 +1,9 @@
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 import psycopg2
+import pandas as pd
+import io
 
 app = FastAPI()
 
@@ -123,9 +126,8 @@ async def editar_redistribucion(request: Request):
         return {"mensaje": "Redistribución actualizada correctamente"}
     except Exception as e:
         return {"error": str(e)}
-        from fastapi.responses import StreamingResponse
-import pandas as pd
-import io
+
+# EXPORTAR EXCEL
 
 @app.get("/exportar-excel")
 def exportar_excel():
@@ -150,7 +152,10 @@ def exportar_excel():
         return StreamingResponse(output, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers=headers)
     except Exception as e:
         return {"error": str(e)}
-        @app.delete("/eliminar-ficticio")
+
+# ELIMINAR REGISTRO FICTICIO
+
+@app.delete("/eliminar-ficticio")
 def eliminar_ficticio():
     try:
         conn = get_connection()
