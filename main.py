@@ -191,4 +191,26 @@ def eliminar_nulos():
         return {"mensaje": "Registros nulos eliminados"}
     except Exception as e:
         return {"error": str(e)}
+        @app.get("/eliminar-nulos")
+def eliminar_nulos():
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            DELETE FROM ruta_activa
+            WHERE camion IS NULL
+              AND nombre IS NULL
+              AND latitud IS NULL
+              AND longitud IS NULL
+              AND litros IS NULL
+              AND dia IS NULL
+              AND telefono IS NULL
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+        return {"mensaje": "Registros nulos eliminados"}
+    except Exception as e:
+        return {"error": str(e)}
+
 
