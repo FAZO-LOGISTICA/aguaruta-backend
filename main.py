@@ -61,7 +61,7 @@ async def editar_ruta(request: Request):
         """, (
             data.get("camion"),
             data.get("litros"),
-            data.get("dia_asignado"),
+            data.get("dia"),  # <-- Este es el campo correcto ahora
             data.get("telefono"),
             data.get("latitud"),
             data.get("longitud"),
