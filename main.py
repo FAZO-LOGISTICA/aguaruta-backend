@@ -12,18 +12,24 @@ import psycopg2
 from psycopg2.pool import SimpleConnectionPool
 from psycopg2.extras import RealDictCursor
 
-app = FastAPI(title="AguaRuta API", version="1.1")
+app = FastAPI(title="AguaRuta API", version="1.2")
 
-# CORS
+# ---------------- CORS ----------------
+ALLOWED_ORIGINS = [
+    "https://aguaruta.netlify.app",  # frontend producción
+    "http://localhost:5173",         # dev Vite (si usas)
+    "http://localhost:3000",         # dev CRA (si usas)
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # en producción, restringe si quieres
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,  # True solo si usas cookies/sesión
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
+    max_age=3600,
 )
 
-# DB
+# ---------------- DB ----------------
 DB_URL = os.getenv(
     "DATABASE_URL",
     "postgresql://aguaruta_db_user:u1JUg0dcbEYzzzoF8N4lsbdZ6c2ZXyPb@dpg-d25b5mripnbc73dpod0g-a.oregon-postgres.render.com/aguaruta_db",
@@ -59,7 +65,7 @@ def get_conn_cursor():
                 pool.putconn(self.conn)
     return _Ctx()
 
-# --------- MODELOS ---------
+# ---------------- MODELOS ----------------
 class EditarRutaPayload(BaseModel):
     id: Optional[int] = Field(None, description="ID en ruta_activa")
     camion: Optional[str] = None
@@ -68,8 +74,8 @@ class EditarRutaPayload(BaseModel):
     telefono: Optional[str] = None
     latitud: Optional[float] = None
     longitud: Optional[float] = None
-    nombre: Optional[str] = None           # <-- ahora editable
-    # compat por nombre (no recomendado)
+    nombre: Optional[str] = None             # ahora editable
+    # compat si todavía buscas por nombre (NO recomendado)
     nombre_lookup: Optional[str] = None
 
 class EditarRedistribucionPayload(BaseModel):
@@ -80,11 +86,10 @@ class EditarRedistribucionPayload(BaseModel):
     telefono: Optional[str] = None
     latitud: Optional[float] = None
     longitud: Optional[float] = None
-    nombre: Optional[str] = None           # <-- editable aquí también
-    # compat
+    nombre: Optional[str] = None
     nombre_lookup: Optional[str] = None
 
-# --------- ENDPOINTS ---------
+# ---------------- ENDPOINTS ----------------
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -106,7 +111,7 @@ def obtener_rutas_activas() -> List[Dict[str, Any]]:
 @app.put("/editar-ruta")
 async def editar_ruta(payload: EditarRutaPayload):
     try:
-        # Resolver ID (preferido)
+        # Resolver ID primero
         id_ruta = payload.id
         if id_ruta is None:
             if not payload.nombre_lookup:
@@ -137,7 +142,7 @@ async def editar_ruta(payload: EditarRutaPayload):
                 payload.telefono,
                 payload.latitud,
                 payload.longitud,
-                payload.nombre,    # <-- ahora se actualiza
+                payload.nombre,
                 id_ruta
             ))
             updated = cur.fetchone()
