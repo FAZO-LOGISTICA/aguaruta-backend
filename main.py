@@ -23,7 +23,7 @@ ALLOWED_ORIGINS = [
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=False,  # True solo si usas cookies/sesión
+    allow_credentials=False,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
     max_age=3600,
@@ -67,19 +67,18 @@ def get_conn_cursor():
 
 # ---------------- MODELOS ----------------
 class EditarRutaPayload(BaseModel):
-    id: Optional[int] = Field(None, description="ID en ruta_activa")
+    id: Optional[int] = Field(None)
     camion: Optional[str] = None
     litros: Optional[float] = None
     dia: Optional[str] = None
     telefono: Optional[str] = None
     latitud: Optional[float] = None
     longitud: Optional[float] = None
-    nombre: Optional[str] = None             # ahora editable
-    # compat si todavía buscas por nombre (NO recomendado)
+    nombre: Optional[str] = None
     nombre_lookup: Optional[str] = None
 
 class EditarRedistribucionPayload(BaseModel):
-    id: Optional[int] = Field(None, description="ID en redistribucion")
+    id: Optional[int] = Field(None)
     camion: Optional[str] = None
     litros: Optional[float] = None
     dia: Optional[str] = None
@@ -90,11 +89,12 @@ class EditarRedistribucionPayload(BaseModel):
     nombre_lookup: Optional[str] = None
 
 # ---------------- ENDPOINTS ----------------
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-# RUTAS ACTIVAS
+# ---------- RUTAS ACTIVAS ----------
 @app.get("/rutas-activas")
 def obtener_rutas_activas() -> List[Dict[str, Any]]:
     try:
@@ -111,7 +111,6 @@ def obtener_rutas_activas() -> List[Dict[str, Any]]:
 @app.put("/editar-ruta")
 async def editar_ruta(payload: EditarRutaPayload):
     try:
-        # Resolver ID primero
         id_ruta = payload.id
         if id_ruta is None:
             if not payload.nombre_lookup:
@@ -120,7 +119,7 @@ async def editar_ruta(payload: EditarRutaPayload):
                 cur.execute("SELECT id FROM ruta_activa WHERE nombre = %s", (payload.nombre_lookup,))
                 row = cur.fetchone()
                 if not row:
-                    raise HTTPException(status_code=404, detail="No se encontró el registro por nombre_lookup")
+                    raise HTTPException(status_code=404, detail="No se encontró el registro")
                 id_ruta = row["id"]
 
         with get_conn_cursor() as (_, cur):
@@ -149,12 +148,10 @@ async def editar_ruta(payload: EditarRutaPayload):
             if not updated:
                 raise HTTPException(status_code=404, detail="No se actualizó ningún registro")
             return {"mensaje": "Ruta actualizada correctamente", "id": updated["id"]}
-    except HTTPException:
-        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# REDISTRIBUCIÓN
+# ---------- REDISTRIBUCIÓN ----------
 @app.get("/redistribucion")
 def obtener_redistribucion() -> List[Dict[str, Any]]:
     try:
@@ -179,7 +176,7 @@ async def editar_redistribucion(payload: EditarRedistribucionPayload):
                 cur.execute("SELECT id FROM redistribucion WHERE nombre = %s", (payload.nombre_lookup,))
                 row = cur.fetchone()
                 if not row:
-                    raise HTTPException(status_code=404, detail="No se encontró el registro por nombre_lookup")
+                    raise HTTPException(status_code=404, detail="No se encontró el registro")
                 id_redist = row["id"]
 
         with get_conn_cursor() as (_, cur):
@@ -208,12 +205,10 @@ async def editar_redistribucion(payload: EditarRedistribucionPayload):
             if not updated:
                 raise HTTPException(status_code=404, detail="No se actualizó ningún registro")
             return {"mensaje": "Redistribución actualizada correctamente", "id": updated["id"]}
-    except HTTPException:
-        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# EXPORTAR EXCEL
+# ---------- EXPORTAR EXCEL ----------
 @app.get("/exportar-excel")
 def exportar_excel():
     try:
@@ -240,12 +235,10 @@ def exportar_excel():
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             headers=headers
         )
-    except HTTPException:
-        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# LIMPIEZA
+# ---------- LIMPIEZA ----------
 @app.get("/eliminar-ficticio")
 def eliminar_ficticio():
     try:
@@ -255,7 +248,7 @@ def eliminar_ficticio():
                 WHERE nombre = 'Juan Pérez' OR telefono = '123456789'
             """)
             count = cur.rowcount
-        return {"mensaje": "Registro(s) ficticio(s) eliminado(s)", "eliminados": count}
+        return {"mensaje": "Ficticios eliminados", "eliminados": count}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -265,15 +258,33 @@ def eliminar_nulos():
         with get_conn_cursor() as (_, cur):
             cur.execute("""
                 DELETE FROM ruta_activa
-                WHERE camion IS NULL
-                  AND nombre IS NULL
-                  AND latitud IS NULL
-                  AND longitud IS NULL
-                  AND litros IS NULL
-                  AND dia IS NULL
-                  AND telefono IS NULL
+                WHERE camion IS NULL AND nombre IS NULL AND
+                      latitud IS NULL AND longitud IS NULL AND
+                      litros IS NULL AND dia IS NULL AND telefono IS NULL
             """)
             count = cur.rowcount
-        return {"mensaje": "Registros nulos eliminados", "eliminados": count}
+        return {"mensaje": "Nulos eliminados", "eliminados": count}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ---------- NUEVO: ENTREGAS APP ----------
+@app.get("/entregas-app")
+def obtener_entregas_app():
+    try:
+        with get_conn_cursor() as (_, cur):
+            cur.execute("""
+                SELECT
+                    nombre,
+                    camion,
+                    litros,
+                    estado,
+                    fecha,
+                    foto_url,
+                    latitud,
+                    longitud
+                FROM entregas_app
+                ORDER BY fecha DESC
+            """)
+            return cur.fetchall()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
