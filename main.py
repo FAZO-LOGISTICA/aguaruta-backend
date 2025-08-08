@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -6,25 +6,26 @@ from typing import Optional, Any, List, Dict
 import os
 import io
 from datetime import datetime
+import shutil
 
 import pandas as pd
 import psycopg2
 from psycopg2.pool import SimpleConnectionPool
 from psycopg2.extras import RealDictCursor
 
-app = FastAPI(title="AguaRuta API", version="1.2")
+app = FastAPI(title="AguaRuta API", version="1.3")
 
 # ---------------- CORS ----------------
 ALLOWED_ORIGINS = [
-    "https://aguaruta.netlify.app",  # frontend producción
-    "http://localhost:5173",         # dev Vite (si usas)
-    "http://localhost:3000",         # dev CRA (si usas)
+    "https://aguaruta.netlify.app",
+    "http://localhost:5173",
+    "http://localhost:3000",
 ]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
-    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_methods=["*"],
     allow_headers=["*"],
     max_age=3600,
 )
@@ -94,7 +95,6 @@ class EditarRedistribucionPayload(BaseModel):
 def health():
     return {"status": "ok"}
 
-# ---------- RUTAS ACTIVAS ----------
 @app.get("/rutas-activas")
 def obtener_rutas_activas() -> List[Dict[str, Any]]:
     try:
@@ -151,7 +151,6 @@ async def editar_ruta(payload: EditarRutaPayload):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ---------- REDISTRIBUCIÓN ----------
 @app.get("/redistribucion")
 def obtener_redistribucion() -> List[Dict[str, Any]]:
     try:
@@ -208,7 +207,6 @@ async def editar_redistribucion(payload: EditarRedistribucionPayload):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ---------- EXPORTAR EXCEL ----------
 @app.get("/exportar-excel")
 def exportar_excel():
     try:
@@ -238,7 +236,6 @@ def exportar_excel():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ---------- LIMPIEZA ----------
 @app.get("/eliminar-ficticio")
 def eliminar_ficticio():
     try:
@@ -267,24 +264,49 @@ def eliminar_nulos():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ---------- NUEVO: ENTREGAS APP ----------
+# ---------- ENTREGAS APP (GET + POST) ----------
 @app.get("/entregas-app")
 def obtener_entregas_app():
     try:
         with get_conn_cursor() as (_, cur):
             cur.execute("""
                 SELECT
-                    nombre,
-                    camion,
-                    litros,
-                    estado,
-                    fecha,
-                    foto_url,
-                    latitud,
-                    longitud
+                    nombre, camion, litros, estado, fecha, foto_url, latitud, longitud
                 FROM entregas_app
                 ORDER BY fecha DESC
             """)
             return cur.fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/entregas-app")
+async def registrar_entrega_app(
+    nombre: str = Form(...),
+    camion: str = Form(...),
+    litros: int = Form(...),
+    estado: int = Form(...),
+    fecha: str = Form(...),
+    latitud: float = Form(...),
+    longitud: float = Form(...),
+    foto: Optional[UploadFile] = File(None)
+):
+    try:
+        foto_url = None
+        if foto:
+            carpeta = "uploads/entregas"
+            os.makedirs(carpeta, exist_ok=True)
+            nombre_archivo = f"{fecha}_{nombre.replace(' ', '_')}_{camion}.jpg"
+            ruta_archivo = os.path.join(carpeta, nombre_archivo)
+            with open(ruta_archivo, "wb") as buffer:
+                shutil.copyfileobj(foto.file, buffer)
+            foto_url = ruta_archivo
+
+        with get_conn_cursor() as (_, cur):
+            cur.execute("""
+                INSERT INTO entregas_app (nombre, camion, litros, estado, fecha, foto_url, latitud, longitud)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """, (nombre, camion, litros, estado, fecha, foto_url, latitud, longitud))
+
+        return {"mensaje": "Entrega registrada correctamente"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
