@@ -310,3 +310,13 @@ async def registrar_entrega_app(
         return {"mensaje": "Entrega registrada correctamente"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+        # === AGREGAR AL FINAL DE backend/main.py (append-only) ===
+try:
+    from routes.entregas import router as entregas_router
+    app.include_router(entregas_router)
+    print("✅ Router /entregas cargado")
+except Exception as e:
+    # No rompe tu app si falla; solo avisa en logs
+    print("⚠️ No se pudo cargar router /entregas:", e)
+# === FIN AGREGADO ===
+
