@@ -319,4 +319,6 @@ except Exception as e:
     # No rompe tu app si falla; solo avisa en logs
     print("⚠️ No se pudo cargar router /entregas:", e)
 # === FIN AGREGADO ===
+from enrutadores.entregas import router as entregas_router
+app.include_router(entregas_router)
 
