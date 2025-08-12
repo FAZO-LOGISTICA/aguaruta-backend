@@ -3,10 +3,10 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from typing import Optional, Any, List, Dict, Tuple
+from typing import Optional, Any, List, Dict, Tuple, Iterator
+from datetime import datetime
 import os
 import io
-from datetime import datetime
 import shutil
 import logging
 
@@ -15,15 +15,15 @@ import psycopg2
 from psycopg2.pool import SimpleConnectionPool
 from psycopg2.extras import RealDictCursor
 
+# -----------------------------------------------------------------------------
+# App & CORS
+# -----------------------------------------------------------------------------
 app = FastAPI(title="AguaRuta API", version="1.4")
-log = logging.getLogger("aguaruta")
-logging.basicConfig(level=logging.INFO)
 
-# ---------------- CORS ----------------
 ALLOWED_ORIGINS = [
-    "https://aguaruta.netlify.app",  # frontend en Netlify
-    "http://localhost:5173",         # vite
+    "https://aguaruta.netlify.app",  # producción (Netlify)
     "http://localhost:3000",         # CRA
+    "http://localhost:5173",         # Vite
 ]
 app.add_middleware(
     CORSMiddleware,
@@ -34,54 +34,48 @@ app.add_middleware(
     max_age=3600,
 )
 
-# ---------------- DB (pool local de main.py) ----------------
+# -----------------------------------------------------------------------------
+# DB Pool
+# -----------------------------------------------------------------------------
+log = logging.getLogger("aguaruta")
+logging.basicConfig(level=logging.INFO)
+
 DB_URL = os.getenv(
     "DATABASE_URL",
+    # default solo por compatibilidad local; en Render usa env var
     "postgresql://aguaruta_db_user:u1JUg0dcbEYzzzoF8N4lsbdZ6c2ZXyPb@dpg-d25b5mripnbc73dpod0g-a.oregon-postgres.render.com/aguaruta_db",
 )
 
 pool: Optional[SimpleConnectionPool] = None
 
+
 @app.on_event("startup")
-def startup():
+def startup() -> None:
     global pool
-    log.info("🔌 Inicializando pool de conexiones (main.py)…")
+    log.info("Inicializando pool de conexiones…")
     pool = SimpleConnectionPool(minconn=1, maxconn=8, dsn=DB_URL)
 
-# intentamos importar el pool del router para cerrarlo también en shutdown
-try:
-    from backend.routes.entregas import router as entregas_router  # type: ignore
-    from backend.routes.entregas import pool as entregas_pool       # type: ignore
-    app.include_router(entregas_router)
-    log.info("✅ Router /entregas cargado desde backend.routes.entregas")
-except Exception as e:
-    entregas_router = None
-    entregas_pool = None
-    log.warning(f"⚠️ No se pudo cargar router /entregas: {e}")
 
 @app.on_event("shutdown")
-def shutdown():
+def shutdown() -> None:
     global pool
-    log.info("🧹 Cerrando pools de conexiones…")
-    try:
-        if pool:
-            pool.closeall()
-            log.info("✅ Pool principal cerrado")
-    finally:
-        if entregas_pool:
-            try:
-                entregas_pool.closeall()
-                log.info("✅ Pool del router de entregas cerrado")
-            except Exception as e:
-                log.warning(f"No se pudo cerrar pool de entregas: {e}")
+    if pool:
+        log.info("Cerrando pool de conexiones…")
+        pool.closeall()
 
-def get_conn_cursor():
-    """Context manager local que entrega (conn, cur) y maneja commit/rollback."""
+
+def get_conn_cursor() -> Iterator[Tuple[psycopg2.extensions.connection, psycopg2.extensions.cursor]]:
+    """
+    Context manager para obtener (conn, cur) con RealDictCursor.
+    """
     class _Ctx:
-        def __enter__(self) -> Tuple[psycopg2.extensions.connection, psycopg2.extensions.cursor]:
+        def __enter__(self):
+            if pool is None:
+                raise RuntimeError("DB pool no inicializado")
             self.conn = pool.getconn()
             self.cur = self.conn.cursor(cursor_factory=RealDictCursor)
             return self.conn, self.cur
+
         def __exit__(self, exc_type, exc, tb):
             try:
                 self.cur.close()
@@ -93,7 +87,10 @@ def get_conn_cursor():
                 pool.putconn(self.conn)
     return _Ctx()
 
-# ---------------- MODELOS ----------------
+
+# -----------------------------------------------------------------------------
+# Modelos
+# -----------------------------------------------------------------------------
 class EditarRutaPayload(BaseModel):
     id: Optional[int] = Field(None)
     camion: Optional[str] = None
@@ -104,6 +101,7 @@ class EditarRutaPayload(BaseModel):
     longitud: Optional[float] = None
     nombre: Optional[str] = None
     nombre_lookup: Optional[str] = None
+
 
 class EditarRedistribucionPayload(BaseModel):
     id: Optional[int] = Field(None)
@@ -116,12 +114,18 @@ class EditarRedistribucionPayload(BaseModel):
     nombre: Optional[str] = None
     nombre_lookup: Optional[str] = None
 
-# ---------------- ENDPOINTS ----------------
 
+# -----------------------------------------------------------------------------
+# Endpoints básicos / utilitarios
+# -----------------------------------------------------------------------------
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
+
+# -----------------------------------------------------------------------------
+# Rutas activas
+# -----------------------------------------------------------------------------
 @app.get("/rutas-activas")
 def obtener_rutas_activas() -> List[Dict[str, Any]]:
     try:
@@ -135,8 +139,9 @@ def obtener_rutas_activas() -> List[Dict[str, Any]]:
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.put("/editar-ruta")
-async def editar_ruta(payload: EditarRutaPayload):
+def editar_ruta(payload: EditarRutaPayload):
     try:
         id_ruta = payload.id
         if id_ruta is None:
@@ -178,6 +183,10 @@ async def editar_ruta(payload: EditarRutaPayload):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# -----------------------------------------------------------------------------
+# Redistribución
+# -----------------------------------------------------------------------------
 @app.get("/redistribucion")
 def obtener_redistribucion() -> List[Dict[str, Any]]:
     try:
@@ -191,8 +200,9 @@ def obtener_redistribucion() -> List[Dict[str, Any]]:
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.put("/editar-redistribucion")
-async def editar_redistribucion(payload: EditarRedistribucionPayload):
+def editar_redistribucion(payload: EditarRedistribucionPayload):
     try:
         id_redist = payload.id
         if id_redist is None:
@@ -234,6 +244,10 @@ async def editar_redistribucion(payload: EditarRedistribucionPayload):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# -----------------------------------------------------------------------------
+# Exportar Excel de rutas activas
+# -----------------------------------------------------------------------------
 @app.get("/exportar-excel")
 def exportar_excel():
     try:
@@ -246,8 +260,8 @@ def exportar_excel():
             filas = cur.fetchall()
         if not filas:
             raise HTTPException(status_code=404, detail="No hay datos para exportar")
-        df = pd.DataFrame(filas)
 
+        df = pd.DataFrame(filas)
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
             df.to_excel(writer, index=False, sheet_name="Rutas")
@@ -263,6 +277,10 @@ def exportar_excel():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# -----------------------------------------------------------------------------
+# Limpiezas rápidas
+# -----------------------------------------------------------------------------
 @app.get("/eliminar-ficticio")
 def eliminar_ficticio():
     try:
@@ -275,6 +293,7 @@ def eliminar_ficticio():
         return {"mensaje": "Ficticios eliminados", "eliminados": count}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/eliminar-nulos")
 def eliminar_nulos():
@@ -291,7 +310,10 @@ def eliminar_nulos():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ---------- ENTREGAS APP (GET + POST) ----------
+
+# -----------------------------------------------------------------------------
+# Entregas App (simple, para formulario + foto)
+# -----------------------------------------------------------------------------
 @app.get("/entregas-app")
 def obtener_entregas_app():
     try:
@@ -306,8 +328,9 @@ def obtener_entregas_app():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.post("/entregas-app")
-async def registrar_entrega_app(
+def registrar_entrega_app(
     nombre: str = Form(...),
     camion: str = Form(...),
     litros: int = Form(...),
@@ -315,7 +338,7 @@ async def registrar_entrega_app(
     fecha: str = Form(...),
     latitud: float = Form(...),
     longitud: float = Form(...),
-    foto: Optional[UploadFile] = File(None)
+    foto: Optional[UploadFile] = File(None),
 ):
     try:
         foto_url = None
@@ -337,3 +360,30 @@ async def registrar_entrega_app(
         return {"mensaje": "Entrega registrada correctamente"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# -----------------------------------------------------------------------------
+# Routers (¡usa el paquete routers/ que ya tienes!)
+# -----------------------------------------------------------------------------
+try:
+    from routers.entregas import router as entregas_router
+    app.include_router(entregas_router)
+    log.info("Router '/entregas' cargado")
+except Exception as e:
+    log.warning("No se pudo cargar router /entregas: %s", e)
+
+try:
+    from routers.redistribucion import router as redis_router
+    app.include_router(redis_router)
+    log.info("Router '/redistribucion' cargado")
+except Exception as e:
+    log.warning("No se pudo cargar router /redistribucion: %s", e)
+
+# (Opcional) si tienes routers/rutas_activas.py
+try:
+    from routers.rutas_activas import router as rutas_router
+    app.include_router(rutas_router)
+    log.info("Router '/rutas-activas (router)' cargado")
+except Exception as e:
+    # no es obligatorio, solo loguea
+    log.info("Router rutas_activas opcional no cargado: %s", e)
