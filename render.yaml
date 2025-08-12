@@ -2,11 +2,14 @@ services:
   - type: web
     name: aguaruta-backend
     env: python
-    region: oregon
-    rootDir: backend
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port 10000
+    plan: free
+    rootDir: aguaruta-backend
+    buildCommand: |
+      pip install --upgrade pip setuptools wheel
+      pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: DATABASE_URL
-        sync: false  # la pones a mano en el panel
-    healthCheckPath: /health
+        sync: false
+      - key: PYTHON_VERSION
+        value: 3.11.9
