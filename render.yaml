@@ -8,6 +8,8 @@ services:
       pip install --upgrade pip setuptools wheel
       pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health         # ← si tienes ese endpoint (lo tienes)
+    autoDeploy: true
     envVars:
       - key: DATABASE_URL
         sync: false
