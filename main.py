@@ -1,25 +1,29 @@
+# main.py
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from typing import Optional, Any, List, Dict
+from typing import Optional, Any, List, Dict, Tuple
 import os
 import io
 from datetime import datetime
 import shutil
+import logging
 
 import pandas as pd
 import psycopg2
 from psycopg2.pool import SimpleConnectionPool
 from psycopg2.extras import RealDictCursor
 
-app = FastAPI(title="AguaRuta API", version="1.3")
+app = FastAPI(title="AguaRuta API", version="1.4")
+log = logging.getLogger("aguaruta")
+logging.basicConfig(level=logging.INFO)
 
 # ---------------- CORS ----------------
 ALLOWED_ORIGINS = [
-    "https://aguaruta.netlify.app",
-    "http://localhost:5173",
-    "http://localhost:3000",
+    "https://aguaruta.netlify.app",  # frontend en Netlify
+    "http://localhost:5173",         # vite
+    "http://localhost:3000",         # CRA
 ]
 app.add_middleware(
     CORSMiddleware,
@@ -30,7 +34,7 @@ app.add_middleware(
     max_age=3600,
 )
 
-# ---------------- DB ----------------
+# ---------------- DB (pool local de main.py) ----------------
 DB_URL = os.getenv(
     "DATABASE_URL",
     "postgresql://aguaruta_db_user:u1JUg0dcbEYzzzoF8N4lsbdZ6c2ZXyPb@dpg-d25b5mripnbc73dpod0g-a.oregon-postgres.render.com/aguaruta_db",
@@ -41,17 +45,40 @@ pool: Optional[SimpleConnectionPool] = None
 @app.on_event("startup")
 def startup():
     global pool
+    log.info("🔌 Inicializando pool de conexiones (main.py)…")
     pool = SimpleConnectionPool(minconn=1, maxconn=8, dsn=DB_URL)
+
+# intentamos importar el pool del router para cerrarlo también en shutdown
+try:
+    from backend.routes.entregas import router as entregas_router  # type: ignore
+    from backend.routes.entregas import pool as entregas_pool       # type: ignore
+    app.include_router(entregas_router)
+    log.info("✅ Router /entregas cargado desde backend.routes.entregas")
+except Exception as e:
+    entregas_router = None
+    entregas_pool = None
+    log.warning(f"⚠️ No se pudo cargar router /entregas: {e}")
 
 @app.on_event("shutdown")
 def shutdown():
     global pool
-    if pool:
-        pool.closeall()
+    log.info("🧹 Cerrando pools de conexiones…")
+    try:
+        if pool:
+            pool.closeall()
+            log.info("✅ Pool principal cerrado")
+    finally:
+        if entregas_pool:
+            try:
+                entregas_pool.closeall()
+                log.info("✅ Pool del router de entregas cerrado")
+            except Exception as e:
+                log.warning(f"No se pudo cerrar pool de entregas: {e}")
 
 def get_conn_cursor():
+    """Context manager local que entrega (conn, cur) y maneja commit/rollback."""
     class _Ctx:
-        def __enter__(self):
+        def __enter__(self) -> Tuple[psycopg2.extensions.connection, psycopg2.extensions.cursor]:
             self.conn = pool.getconn()
             self.cur = self.conn.cursor(cursor_factory=RealDictCursor)
             return self.conn, self.cur
@@ -310,12 +337,3 @@ async def registrar_entrega_app(
         return {"mensaje": "Entrega registrada correctamente"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-# -------------- Routers adicionales --------------
-# SOLO UNO: usa enrutadores/entregas.py (tu carpeta real). No dupliques.
-try:
-    from enrutadores.entregas import router as entregas_router
-    app.include_router(entregas_router)
-    print("✅ Router /entregas cargado")
-except Exception as e:
-    print("⚠️ No se pudo cargar router /entregas:", e)
