@@ -1,6 +1,18 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
+
+# DB (usa wheel, no compila)
 psycopg2-binary==2.9.9
+
+# Excel / Data
 pandas==2.2.2
+numpy==1.26.4
 openpyxl==3.1.5
+
+# Uploads/form-data
 python-multipart==0.0.9
+
+# Compatibilidad Pydantic v2 (FastAPI ya es v2-ready)
+pydantic==2.9.2
+pydantic-core==2.23.4
+typing-extensions==4.12.2
