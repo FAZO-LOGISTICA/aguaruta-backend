@@ -1,86 +1,129 @@
 # backend/rutas_activas.py
 from fastapi import APIRouter, HTTPException
-import pandas as pd
 from pathlib import Path
+import pandas as pd
+import unicodedata
 
-router = APIRouter()
+# Evita colisión con /rutas-activas (DB) del main.py
+router = APIRouter(prefix="/rutas-activas-excel", tags=["rutas-activas-excel"])
 
-RUTA_BASE = Path("data/base_datos_todos_con_coordenadas.xlsx")
+def data_path(relative: str) -> Path:
+    backend_dir = Path(__file__).resolve().parent  # .../backend
+    return (backend_dir / relative).resolve()
+
+RUTA_BASE = data_path("data/base_datos_todos_con_coordenadas.xlsx")
 CAMIONES_VALIDOS = ['A1', 'A2', 'A3', 'A4', 'A5', 'M1', 'M2']
 
-@router.get("/rutas-activas")
-def obtener_rutas_activas():
+def norm(s: str) -> str:
+    s = s.lower().strip().replace(" ", "_")
+    s = "".join(ch for ch in unicodedata.normalize("NFD", s) if unicodedata.category(ch) != "Mn")
+    return s
+
+def find_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    cand_norm = [norm(c) for c in candidates]
+    mapping = {norm(c): c for c in df.columns}
+    for c in cand_norm:
+        if c in mapping:
+            return mapping[c]
+    return None
+
+@router.get("")
+def obtener_rutas_activas_excel():
     try:
+        if not RUTA_BASE.exists():
+            raise HTTPException(status_code=404, detail=f"No existe archivo: {RUTA_BASE}")
         df = pd.read_excel(RUTA_BASE)
-        df.columns = [col.lower().strip().replace(" ", "_") for col in df.columns]
         df = df.fillna("")
         return df.to_dict(orient="records")
+    except HTTPException:
+        raise
     except Exception as e:
-        return {"error": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/puntos")
-def obtener_puntos():
+def obtener_puntos_excel():
     try:
+        if not RUTA_BASE.exists():
+            raise HTTPException(status_code=404, detail=f"No existe archivo: {RUTA_BASE}")
         df = pd.read_excel(RUTA_BASE)
-        df.columns = [col.lower().strip().replace(" ", "_") for col in df.columns]
 
-        nombre_col = next((c for c in df.columns if "nombre" in c), None)
-        litros_col = next((c for c in df.columns if "litro" in c), None)
-        lat_col = next((c for c in df.columns if "lat" in c), None)
-        lon_col = next((c for c in df.columns if "lon" in c or "long" in c), None)
+        nombre_col = find_col(df, ["nombre", "nombre_(jefe_de_hogar)", "nombre_jefe_de_hogar"])
+        litros_col = find_col(df, ["litros_de_entrega", "litros"])
+        lat_col    = find_col(df, ["latitud"])
+        lon_col    = find_col(df, ["longitud", "long"])
 
         if not all([lat_col, lon_col, nombre_col, litros_col]):
-            return {"error": "Faltan columnas necesarias"}
+            raise HTTPException(status_code=400, detail="Faltan columnas necesarias (latitud/longitud/nombre/litros)")
 
-        df = df.rename(columns={
+        sub = df[[lat_col, lon_col, nombre_col, litros_col]].rename(columns={
             nombre_col: "nombre",
             litros_col: "litros",
-            lat_col: "latitud",
-            lon_col: "longitud"
+            lat_col:    "latitud",
+            lon_col:    "longitud",
         })
-
-        df = df.dropna(subset=["latitud", "longitud", "nombre", "litros"])
-        return df[["latitud", "longitud", "nombre", "litros"]].to_dict(orient="records")
+        sub = sub.dropna(subset=["latitud", "longitud", "nombre", "litros"])
+        return sub.to_dict(orient="records")
+    except HTTPException:
+        raise
     except Exception as e:
-        return {"error": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/registrar-nuevo-punto")
 def registrar_nuevo_punto(punto: dict):
     try:
         if not RUTA_BASE.exists():
-            raise HTTPException(status_code=404, detail="Base de datos no encontrada")
+            raise HTTPException(status_code=404, detail=f"No existe archivo: {RUTA_BASE}")
 
         df = pd.read_excel(RUTA_BASE)
-        df.columns = [col.lower().strip().replace(" ", "_") for col in df.columns]
         df = df.fillna("")
 
-        # Agrupar por camión actual
-        df_actual = df[df['id_camión'].isin(CAMIONES_VALIDOS)]
-        resumen = df_actual.groupby('id_camión')['litros_de_entrega'].sum().to_dict()
+        id_camion_col = find_col(df, ["id_camión", "id_camion", "id camion"])
+        litros_col    = find_col(df, ["litros_de_entrega", "litros"])
+        nombre_col    = find_col(df, ["nombre_(jefe_de_hogar)", "nombre"])
+        dia_col       = find_col(df, ["dia", "día"])
+        tel_col       = find_col(df, ["telefono", "teléfono", "fono"])
+        lat_col       = find_col(df, ["latitud"])
+        lon_col       = find_col(df, ["longitud"])
+        sector_col    = find_col(df, ["sector"])
 
-        # Elegir camión con menor carga total
-        asignar_a = min(CAMIONES_VALIDOS, key=lambda c: resumen.get(c, 0))
+        # crea columnas si faltan
+        created_cols = []
+        if id_camion_col is None:
+            id_camion_col = "id_camion"
+            df[id_camion_col] = ""
+            created_cols.append(id_camion_col)
+        if litros_col is None:
+            litros_col = "litros"
+            df[litros_col] = 0
+            created_cols.append(litros_col)
 
-        # Asignar día tentativo (puedes ajustar lógica más adelante)
-        dia = "LUNES"
+        # resumen por camión (si hay datos previos)
+        resumen = df.groupby(id_camion_col)[litros_col].sum(min_count=1).to_dict() if litros_col in df.columns else {}
+        asignar_a = min(CAMIONES_VALIDOS, key=lambda c: resumen.get(c, 0) if resumen else 0)
+
+        # día tentativo (puedes mejorar la lógica luego)
+        dia_val = "LUNES"
 
         nuevo = {
-            "id_camión": asignar_a,
+            id_camion_col: asignar_a,
             "patente": "",
             "conductor": "",
-            "dia": dia,
-            "nombre_(jefe_de_hogar)": punto["nombre"],
-            "telefono": punto["telefono"],
-            "sector": punto["sector"],
-            "litros_de_entrega": punto["litros"],
-            "latitud": punto["latitud"],
-            "longitud": punto["longitud"]
+            (dia_col or "dia"): dia_val,
+            (nombre_col or "nombre"): punto["nombre"],
+            (tel_col or "telefono"): punto.get("telefono", ""),
+            (sector_col or "sector"): punto.get("sector", ""),
+            (litros_col or "litros"): punto["litros"],
+            (lat_col or "latitud"): punto["latitud"],
+            (lon_col or "longitud"): punto["longitud"],
         }
 
         df_nuevo = pd.concat([df, pd.DataFrame([nuevo])], ignore_index=True)
         df_nuevo.to_excel(RUTA_BASE, index=False)
 
-        return {"mensaje": "✅ Punto registrado", "camion_asignado": asignar_a}
+        msg_extra = f" (creadas columnas: {', '.join(created_cols)})" if created_cols else ""
+        return {"mensaje": f"✅ Punto registrado{msg_extra}", "camion_asignado": asignar_a}
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
