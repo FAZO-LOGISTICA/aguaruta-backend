@@ -18,28 +18,35 @@ from psycopg2.extras import RealDictCursor
 # -----------------------------------------------------------------------------
 # App & CORS
 # -----------------------------------------------------------------------------
-app = FastAPI(title="AguaRuta API", version="1.4")
+app = FastAPI(title="AguaRuta API", version="1.5")
 
 ALLOWED_ORIGINS = [
     "https://aguaruta.netlify.app",  # producción (Netlify)
     "http://localhost:3000",         # CRA
     "http://localhost:5173",         # Vite
 ]
+# Permite también deploy previews/branches: https://*.netlify.app
+ALLOWED_ORIGIN_REGEX = r"https://.*\.netlify\.app$"
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=False,
-    allow_methods=["*"],
+    allow_origin_regex=ALLOWED_ORIGIN_REGEX,
+    allow_credentials=False,  # si no usas cookies/sesiones, mejor False
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
     max_age=3600,
 )
 
 # -----------------------------------------------------------------------------
-# DB Pool
+# Logging
 # -----------------------------------------------------------------------------
 log = logging.getLogger("aguaruta")
 logging.basicConfig(level=logging.INFO)
 
+# -----------------------------------------------------------------------------
+# DB Pool
+# -----------------------------------------------------------------------------
 DB_URL = os.getenv(
     "DATABASE_URL",
     # default solo por compatibilidad local; en Render usa env var
@@ -64,9 +71,13 @@ def shutdown() -> None:
         pool.closeall()
 
 
-def get_conn_cursor() -> Iterator[Tuple[psycopg2.extensions.connection, psycopg2.extensions.cursor]]:
+def get_conn_cursor() -> Iterator[Tuple[psycopg2.extensions.connection, psycopg2.extensions.cursor]]:  # type: ignore[name-defined]
     """
     Context manager para obtener (conn, cur) con RealDictCursor.
+    Uso:
+        with get_conn_cursor() as (_, cur):
+            cur.execute("SELECT ...")
+            rows = cur.fetchall()
     """
     class _Ctx:
         def __enter__(self):
@@ -124,7 +135,7 @@ def health():
 
 
 # -----------------------------------------------------------------------------
-# Rutas activas
+# Rutas activas (OFICIAL - DB)
 # -----------------------------------------------------------------------------
 @app.get("/rutas-activas")
 def obtener_rutas_activas() -> List[Dict[str, Any]]:
@@ -180,12 +191,14 @@ def editar_ruta(payload: EditarRutaPayload):
             if not updated:
                 raise HTTPException(status_code=404, detail="No se actualizó ningún registro")
             return {"mensaje": "Ruta actualizada correctamente", "id": updated["id"]}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 # -----------------------------------------------------------------------------
-# Redistribución
+# Redistribución (OFICIAL - DB)
 # -----------------------------------------------------------------------------
 @app.get("/redistribucion")
 def obtener_redistribucion() -> List[Dict[str, Any]]:
@@ -241,12 +254,14 @@ def editar_redistribucion(payload: EditarRedistribucionPayload):
             if not updated:
                 raise HTTPException(status_code=404, detail="No se actualizó ningún registro")
             return {"mensaje": "Redistribución actualizada correctamente", "id": updated["id"]}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 # -----------------------------------------------------------------------------
-# Exportar Excel de rutas activas
+# Exportar Excel de rutas activas (DB)
 # -----------------------------------------------------------------------------
 @app.get("/exportar-excel")
 def exportar_excel():
@@ -279,7 +294,7 @@ def exportar_excel():
 
 
 # -----------------------------------------------------------------------------
-# Limpiezas rápidas
+# Limpiezas rápidas (DB)
 # -----------------------------------------------------------------------------
 @app.get("/eliminar-ficticio")
 def eliminar_ficticio():
@@ -312,7 +327,7 @@ def eliminar_nulos():
 
 
 # -----------------------------------------------------------------------------
-# Entregas App (simple, para formulario + foto)
+# Entregas App (DB + foto opcional)
 # -----------------------------------------------------------------------------
 @app.get("/entregas-app")
 def obtener_entregas_app():
@@ -363,27 +378,23 @@ def registrar_entrega_app(
 
 
 # -----------------------------------------------------------------------------
-# Routers (¡usa el paquete routers/ que ya tienes!)
+# Routers EXCEL (NO colisionan con los oficiales)
 # -----------------------------------------------------------------------------
+# - routers/redistribucion.py  -> expone /nueva-distribucion/...
+# - backend/rutas_activas.py   -> expone /rutas-activas-excel/...
 try:
-    from routers.entregas import router as entregas_router
-    app.include_router(entregas_router)
-    log.info("Router '/entregas' cargado")
+    from routers.redistribucion import router as nueva_redis_router  # debe tener prefix="/nueva-distribucion"
+    app.include_router(nueva_redis_router)
+    log.info("Router '/nueva-distribucion' cargado")
 except Exception as e:
-    log.warning("No se pudo cargar router /entregas: %s", e)
+    log.warning("No se pudo cargar router /nueva-distribucion: %s", e)
 
 try:
-    from routers.redistribucion import router as redis_router
-    app.include_router(redis_router)
-    log.info("Router '/redistribucion' cargado")
+    # Ajusta el import según tu estructura real del repo:
+    # Si el archivo está en backend/rutas_activas.py y 'backend' es paquete, este import funciona.
+    # Si está en routers/rutas_activas_excel.py, cambia el path aquí.
+    from backend.rutas_activas import router as rutas_excel_router  # debe tener prefix="/rutas-activas-excel"
+    app.include_router(rutas_excel_router)
+    log.info("Router '/rutas-activas-excel' cargado")
 except Exception as e:
-    log.warning("No se pudo cargar router /redistribucion: %s", e)
-
-# (Opcional) si tienes routers/rutas_activas.py
-try:
-    from routers.rutas_activas import router as rutas_router
-    app.include_router(rutas_router)
-    log.info("Router '/rutas-activas (router)' cargado")
-except Exception as e:
-    # no es obligatorio, solo loguea
-    log.info("Router rutas_activas opcional no cargado: %s", e)
+    log.warning("No se pudo cargar router /rutas-activas-excel: %s", e)
