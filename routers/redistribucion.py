@@ -1,39 +1,53 @@
+# routers/redistribucion.py
 from fastapi import APIRouter
 from pathlib import Path
 import pandas as pd
 import random
 
-router = APIRouter()
+# Este prefix evita colisiones con /redistribucion (DB) del main.py
+router = APIRouter(prefix="/nueva-distribucion", tags=["nueva-distribucion"])
+
+def data_path(relative: str) -> Path:
+    """
+    Resuelve rutas en local y en Render.
+    Asumiendo estructura:
+      backend/
+        data/Puntos_Nuevos_Consolidados.xlsx
+        routers/redistribucion.py (este archivo)
+    """
+    backend_dir = Path(__file__).resolve().parents[1]  # .../backend
+    return (backend_dir / relative).resolve()
 
 @router.get("/puntos-nuevos")
 def get_nuevos_puntos():
-    filepath = Path("backend/data/Puntos_Nuevos_Consolidados.xlsx")
-
+    filepath = data_path("data/Puntos_Nuevos_Consolidados.xlsx")
     if not filepath.exists():
-        return {"error": "Archivo no encontrado."}
+        return {"error": f"Archivo no encontrado: {filepath}"}
 
     try:
         df = pd.read_excel(filepath)
-        df.columns = [col.strip().lower().replace(" ", "_") for col in df.columns]
+        # normaliza cabeceras
+        df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
 
+        # columnas mínimas
         columnas_necesarias = ["nombre", "telefono", "litros", "latitud", "longitud"]
-        df = df[[col for col in columnas_necesarias if col in df.columns]]
+        cols_presentes = [c for c in columnas_necesarias if c in df.columns]
+        if not cols_presentes:
+            return {"error": f"No se encontraron columnas necesarias en {filepath.name}"}
 
-        return df.to_dict(orient="records")
-
+        return df[cols_presentes].to_dict(orient="records")
     except Exception as e:
         return {"error": str(e)}
 
 @router.post("/redistribuir")
 def redistribuir_puntos():
-    filepath = Path("backend/data/Puntos_Nuevos_Consolidados.xlsx")
-
+    filepath = data_path("data/Puntos_Nuevos_Consolidados.xlsx")
     if not filepath.exists():
-        return {"error": "Archivo no encontrado."}
+        return {"error": f"Archivo no encontrado: {filepath}"}
 
     try:
         df = pd.read_excel(filepath)
-        df.columns = [col.strip().lower().replace(" ", "_") for col in df.columns]
+        df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
 
         camiones_disponibles = ["A1", "A2", "A3", "A4", "A5", "M1", "M2"]
         asignaciones = []
@@ -45,6 +59,5 @@ def redistribuir_puntos():
             asignaciones.append(nuevo)
 
         return asignaciones
-
     except Exception as e:
         return {"error": str(e)}
