@@ -1,4 +1,3 @@
-# main.py
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -21,21 +20,17 @@ from psycopg2.extras import RealDictCursor
 app = FastAPI(title="AguaRuta API", version="1.5")
 
 ALLOWED_ORIGINS = [
-    "https://aguaruta.netlify.app",  # producción (Netlify)
-    "http://localhost:3000",         # CRA
-    "http://localhost:5173",         # Vite
+    "https://aguaruta.netlify.app",  # Producción
+    "http://localhost:3000",         # CRA local
+    "http://localhost:5173",         # Vite local
 ]
-# Permite también deploy previews/branches: https://*.netlify.app
-ALLOWED_ORIGIN_REGEX = r"https://.*\.netlify\.app$"
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_origin_regex=ALLOWED_ORIGIN_REGEX,
-    allow_credentials=False,  # si no usas cookies/sesiones, mejor False
-    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_credentials=True,   # compatibilidad con axios/fetch
+    allow_methods=["*"],
     allow_headers=["*"],
-    max_age=3600,
 )
 
 # -----------------------------------------------------------------------------
@@ -49,19 +44,16 @@ logging.basicConfig(level=logging.INFO)
 # -----------------------------------------------------------------------------
 DB_URL = os.getenv(
     "DATABASE_URL",
-    # default solo por compatibilidad local; en Render usa env var
     "postgresql://aguaruta_db_user:u1JUg0dcbEYzzzoF8N4lsbdZ6c2ZXyPb@dpg-d25b5mripnbc73dpod0g-a.oregon-postgres.render.com/aguaruta_db",
 )
 
 pool: Optional[SimpleConnectionPool] = None
-
 
 @app.on_event("startup")
 def startup() -> None:
     global pool
     log.info("Inicializando pool de conexiones…")
     pool = SimpleConnectionPool(minconn=1, maxconn=8, dsn=DB_URL)
-
 
 @app.on_event("shutdown")
 def shutdown() -> None:
@@ -70,15 +62,7 @@ def shutdown() -> None:
         log.info("Cerrando pool de conexiones…")
         pool.closeall()
 
-
-def get_conn_cursor() -> Iterator[Tuple[psycopg2.extensions.connection, psycopg2.extensions.cursor]]:  # type: ignore[name-defined]
-    """
-    Context manager para obtener (conn, cur) con RealDictCursor.
-    Uso:
-        with get_conn_cursor() as (_, cur):
-            cur.execute("SELECT ...")
-            rows = cur.fetchall()
-    """
+def get_conn_cursor() -> Iterator[Tuple[psycopg2.extensions.connection, psycopg2.extensions.cursor]]:
     class _Ctx:
         def __enter__(self):
             if pool is None:
@@ -98,7 +82,6 @@ def get_conn_cursor() -> Iterator[Tuple[psycopg2.extensions.connection, psycopg2
                 pool.putconn(self.conn)
     return _Ctx()
 
-
 # -----------------------------------------------------------------------------
 # Modelos
 # -----------------------------------------------------------------------------
@@ -113,7 +96,6 @@ class EditarRutaPayload(BaseModel):
     nombre: Optional[str] = None
     nombre_lookup: Optional[str] = None
 
-
 class EditarRedistribucionPayload(BaseModel):
     id: Optional[int] = Field(None)
     camion: Optional[str] = None
@@ -125,17 +107,15 @@ class EditarRedistribucionPayload(BaseModel):
     nombre: Optional[str] = None
     nombre_lookup: Optional[str] = None
 
-
 # -----------------------------------------------------------------------------
-# Endpoints básicos / utilitarios
+# Endpoints básicos
 # -----------------------------------------------------------------------------
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-
 # -----------------------------------------------------------------------------
-# Rutas activas (OFICIAL - DB)
+# Rutas activas (DB)
 # -----------------------------------------------------------------------------
 @app.get("/rutas-activas")
 def obtener_rutas_activas() -> List[Dict[str, Any]]:
@@ -149,7 +129,6 @@ def obtener_rutas_activas() -> List[Dict[str, Any]]:
             return cur.fetchall()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.put("/editar-ruta")
 def editar_ruta(payload: EditarRutaPayload):
@@ -196,9 +175,8 @@ def editar_ruta(payload: EditarRutaPayload):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 # -----------------------------------------------------------------------------
-# Redistribución (OFICIAL - DB)
+# Redistribución (DB)
 # -----------------------------------------------------------------------------
 @app.get("/redistribucion")
 def obtener_redistribucion() -> List[Dict[str, Any]]:
@@ -212,7 +190,6 @@ def obtener_redistribucion() -> List[Dict[str, Any]]:
             return cur.fetchall()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.put("/editar-redistribucion")
 def editar_redistribucion(payload: EditarRedistribucionPayload):
@@ -259,9 +236,8 @@ def editar_redistribucion(payload: EditarRedistribucionPayload):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 # -----------------------------------------------------------------------------
-# Exportar Excel de rutas activas (DB)
+# Exportar Excel
 # -----------------------------------------------------------------------------
 @app.get("/exportar-excel")
 def exportar_excel():
@@ -292,9 +268,8 @@ def exportar_excel():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 # -----------------------------------------------------------------------------
-# Limpiezas rápidas (DB)
+# Limpiezas rápidas
 # -----------------------------------------------------------------------------
 @app.get("/eliminar-ficticio")
 def eliminar_ficticio():
@@ -308,7 +283,6 @@ def eliminar_ficticio():
         return {"mensaje": "Ficticios eliminados", "eliminados": count}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.get("/eliminar-nulos")
 def eliminar_nulos():
@@ -325,9 +299,8 @@ def eliminar_nulos():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 # -----------------------------------------------------------------------------
-# Entregas App (DB + foto opcional)
+# Entregas App
 # -----------------------------------------------------------------------------
 @app.get("/entregas-app")
 def obtener_entregas_app():
@@ -342,7 +315,6 @@ def obtener_entregas_app():
             return cur.fetchall()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.post("/entregas-app")
 def registrar_entrega_app(
@@ -376,24 +348,18 @@ def registrar_entrega_app(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 # -----------------------------------------------------------------------------
-# Routers EXCEL (NO colisionan con los oficiales)
+# Routers externos
 # -----------------------------------------------------------------------------
-# - routers/redistribucion.py  -> expone /nueva-distribucion/...
-# - backend/rutas_activas.py   -> expone /rutas-activas-excel/...
 try:
-    from routers.redistribucion import router as nueva_redis_router  # debe tener prefix="/nueva-distribucion"
+    from routers.redistribucion import router as nueva_redis_router
     app.include_router(nueva_redis_router)
     log.info("Router '/nueva-distribucion' cargado")
 except Exception as e:
     log.warning("No se pudo cargar router /nueva-distribucion: %s", e)
 
 try:
-    # Ajusta el import según tu estructura real del repo:
-    # Si el archivo está en backend/rutas_activas.py y 'backend' es paquete, este import funciona.
-    # Si está en routers/rutas_activas_excel.py, cambia el path aquí.
-    from backend.rutas_activas import router as rutas_excel_router  # debe tener prefix="/rutas-activas-excel"
+    from routers.rutas_activas_excel import router as rutas_excel_router
     app.include_router(rutas_excel_router)
     log.info("Router '/rutas-activas-excel' cargado")
 except Exception as e:
