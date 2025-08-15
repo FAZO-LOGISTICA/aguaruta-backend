@@ -1,3 +1,4 @@
+# main.py
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -8,6 +9,9 @@ import os
 import io
 import shutil
 import logging
+import json
+import ssl
+from urllib.request import urlopen
 
 import pandas as pd
 import psycopg2
@@ -17,18 +21,17 @@ from psycopg2.extras import RealDictCursor
 # -----------------------------------------------------------------------------
 # App & CORS
 # -----------------------------------------------------------------------------
-app = FastAPI(title="AguaRuta API", version="1.5")
+app = FastAPI(title="AguaRuta API", version="1.6")
 
 ALLOWED_ORIGINS = [
     "https://aguaruta.netlify.app",  # Producción
     "http://localhost:3000",         # CRA local
     "http://localhost:5173",         # Vite local
 ]
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,   # compatibilidad con axios/fetch
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -40,12 +43,18 @@ log = logging.getLogger("aguaruta")
 logging.basicConfig(level=logging.INFO)
 
 # -----------------------------------------------------------------------------
-# DB Pool
+# DB Pool (+ airbag)
 # -----------------------------------------------------------------------------
-DB_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql://aguaruta_db_user:u1JUg0dcbEYzzzoF8N4lsbdZ6c2ZXyPb@dpg-d25b5mripnbc73dpod0g-a.oregon-postgres.render.com/aguaruta_db",
-)
+DB_URL = os.getenv("DATABASE_URL") or os.getenv("DB_URL") or \
+    "postgresql://aguaruta_db_user:u1JUg0dcbEYzzzoF8N4lsbdZ6c2ZXyPb@dpg-d25b5mripnbc73dpod0g-a.oregon-postgres.render.com:5432/aguaruta_db"
+
+DB_URL = DB_URL.strip()
+# Corrige nombre con guion
+if "aguaruta-db" in DB_URL:
+    DB_URL = DB_URL.replace("aguaruta-db", "aguaruta_db")
+# Fuerza SSL
+if "sslmode=" not in DB_URL:
+    DB_URL += ("&" if "?" in DB_URL else "?") + "sslmode=require"
 
 pool: Optional[SimpleConnectionPool] = None
 
@@ -62,7 +71,7 @@ def shutdown() -> None:
         log.info("Cerrando pool de conexiones…")
         pool.closeall()
 
-def get_conn_cursor() -> Iterator[Tuple[psycopg2.extensions.connection, psycopg2.extensions.cursor]]:
+def get_conn_cursor() -> Iterator[Tuple[psycopg2.extensions.connection, psycopg2.extensions.cursor]]:  # type: ignore[name-defined]
     class _Ctx:
         def __enter__(self):
             if pool is None:
@@ -70,17 +79,50 @@ def get_conn_cursor() -> Iterator[Tuple[psycopg2.extensions.connection, psycopg2
             self.conn = pool.getconn()
             self.cur = self.conn.cursor(cursor_factory=RealDictCursor)
             return self.conn, self.cur
-
         def __exit__(self, exc_type, exc, tb):
             try:
                 self.cur.close()
-                if exc:
-                    self.conn.rollback()
-                else:
-                    self.conn.commit()
+                (self.conn.rollback() if exc else self.conn.commit())
             finally:
                 pool.putconn(self.conn)
     return _Ctx()
+
+# -----------------------------------------------------------------------------
+# Fallback JSON para redistribución (solo lectura)
+# -----------------------------------------------------------------------------
+FALLBACK_JSON_URL = os.getenv(
+    "REDIST_FALLBACK_URL",
+    "https://aguaruta.netlify.app/datos/RutasMapaFinal_con_telefono.json",
+)
+
+def cargar_fallback_redistribucion(limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Lee y normaliza el JSON público cuando la DB no tiene datos."""
+    try:
+        ctx = ssl.create_default_context()
+        with urlopen(FALLBACK_JSON_URL, context=ctx, timeout=10) as resp:
+            raw = json.loads(resp.read().decode("utf-8"))
+        out: List[Dict[str, Any]] = []
+        for i, r in enumerate(raw, start=1):
+            lat = r.get("latitud") or r.get("lat") or r.get("latitude")
+            lon = r.get("longitud") or r.get("lon") or r.get("lng") or r.get("longitude")
+            if lat is None or lon is None:
+                continue
+            out.append({
+                "id": r.get("id") or i,
+                "camion": r.get("camion") or r.get("CAMION") or r.get("camion_asignado"),
+                "nombre": r.get("nombre") or r.get("NOMBRE") or r.get("jefe_hogar") or r.get("jefe"),
+                "dia": r.get("dia_asignado") or r.get("dia") or r.get("DIA"),
+                "litros": r.get("litros") or r.get("LITROS") or r.get("litros_de_entrega"),
+                "telefono": r.get("telefono") or r.get("TELEFONO") or r.get("phone"),
+                "latitud": float(lat),
+                "longitud": float(lon),
+            })
+            if limit and len(out) >= limit:
+                break
+        return out
+    except Exception as e:
+        log.warning("Fallback JSON de redistribución no disponible: %s", e)
+        return []
 
 # -----------------------------------------------------------------------------
 # Modelos
@@ -176,10 +218,11 @@ def editar_ruta(payload: EditarRutaPayload):
         raise HTTPException(status_code=500, detail=str(e))
 
 # -----------------------------------------------------------------------------
-# Redistribución (DB)
+# Redistribución (DB -> JSON fallback)
 # -----------------------------------------------------------------------------
 @app.get("/redistribucion")
 def obtener_redistribucion() -> List[Dict[str, Any]]:
+    # 1) Intento DB
     try:
         with get_conn_cursor() as (_, cur):
             cur.execute("""
@@ -187,9 +230,28 @@ def obtener_redistribucion() -> List[Dict[str, Any]]:
                 FROM redistribucion
                 ORDER BY camion, dia, nombre
             """)
-            return cur.fetchall()
+            filas = cur.fetchall()
+        if filas:
+            return filas
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        log.warning("DB error en /redistribucion, probando fallback JSON: %s", e)
+
+    # 2) Fallback JSON (solo lectura)
+    datos = cargar_fallback_redistribucion()
+    if datos:
+        log.info("Usando fallback JSON para /redistribucion (%s registros).", len(datos))
+    return datos
+
+@app.get("/redistribucion/source")
+def redistribucion_source():
+    try:
+        with get_conn_cursor() as (_, cur):
+            cur.execute("SELECT 1 FROM redistribucion LIMIT 1;")
+            if cur.fetchone():
+                return {"source": "db"}
+    except Exception:
+        pass
+    return {"source": "json"}
 
 @app.put("/editar-redistribucion")
 def editar_redistribucion(payload: EditarRedistribucionPayload):
@@ -237,7 +299,7 @@ def editar_redistribucion(payload: EditarRedistribucionPayload):
         raise HTTPException(status_code=500, detail=str(e))
 
 # -----------------------------------------------------------------------------
-# Exportar Excel
+# Exportar Excel (rutas activas)
 # -----------------------------------------------------------------------------
 @app.get("/exportar-excel")
 def exportar_excel():
@@ -269,7 +331,7 @@ def exportar_excel():
         raise HTTPException(status_code=500, detail=str(e))
 
 # -----------------------------------------------------------------------------
-# Limpiezas rápidas
+# Limpiezas rápidas (DB)
 # -----------------------------------------------------------------------------
 @app.get("/eliminar-ficticio")
 def eliminar_ficticio():
@@ -349,18 +411,20 @@ def registrar_entrega_app(
         raise HTTPException(status_code=500, detail=str(e))
 
 # -----------------------------------------------------------------------------
-# Routers externos
+# Routers externos opcionales
 # -----------------------------------------------------------------------------
 try:
-    from routers.redistribucion import router as nueva_redis_router
+    from routers.redistribucion import router as nueva_redis_router  # prefix="/nueva-distribucion"
     app.include_router(nueva_redis_router)
     log.info("Router '/nueva-distribucion' cargado")
 except Exception as e:
     log.warning("No se pudo cargar router /nueva-distribucion: %s", e)
 
 try:
-    from routers.rutas_activas_excel import router as rutas_excel_router
-    app.include_router(rutas_excel_router)
-    log.info("Router '/rutas-activas-excel' cargado")
+    # Actívalo solo si existe ese archivo/paquete
+    if os.getenv("ENABLE_RUTAS_ACTIVAS_EXCEL") == "1":
+        from routers.rutas_activas_excel import router as rutas_excel_router  # prefix="/rutas-activas-excel"
+        app.include_router(rutas_excel_router)
+        log.info("Router '/rutas-activas-excel' cargado")
 except Exception as e:
     log.warning("No se pudo cargar router /rutas-activas-excel: %s", e)
