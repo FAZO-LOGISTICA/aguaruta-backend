@@ -16,12 +16,12 @@ from urllib.request import urlopen
 import pandas as pd
 import psycopg2
 from psycopg2.pool import SimpleConnectionPool
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import RealDictCursor, execute_values
 
 # -----------------------------------------------------------------------------
 # App & CORS
 # -----------------------------------------------------------------------------
-app = FastAPI(title="AguaRuta API", version="1.6")
+app = FastAPI(title="AguaRuta API", version="1.7")
 
 ALLOWED_ORIGINS = [
     "https://aguaruta.netlify.app",  # Producción
@@ -58,18 +58,6 @@ if "sslmode=" not in DB_URL:
 
 pool: Optional[SimpleConnectionPool] = None
 
-@app.on_event("startup")
-def startup() -> None:
-    global pool
-    log.info("Inicializando pool de conexiones…")
-    pool = SimpleConnectionPool(minconn=1, maxconn=8, dsn=DB_URL)
-
-@app.on_event("shutdown")
-def shutdown() -> None:
-    global pool
-    if pool:
-        log.info("Cerrando pool de conexiones…")
-        pool.closeall()
 
 def get_conn_cursor() -> Iterator[Tuple[psycopg2.extensions.connection, psycopg2.extensions.cursor]]:  # type: ignore[name-defined]
     class _Ctx:
@@ -79,6 +67,7 @@ def get_conn_cursor() -> Iterator[Tuple[psycopg2.extensions.connection, psycopg2
             self.conn = pool.getconn()
             self.cur = self.conn.cursor(cursor_factory=RealDictCursor)
             return self.conn, self.cur
+
         def __exit__(self, exc_type, exc, tb):
             try:
                 self.cur.close()
@@ -95,6 +84,7 @@ FALLBACK_JSON_URL = os.getenv(
     "https://aguaruta.netlify.app/datos/RutasMapaFinal_con_telefono.json",
 )
 
+
 def cargar_fallback_redistribucion(limit: Optional[int] = None) -> List[Dict[str, Any]]:
     """Lee y normaliza el JSON público cuando la DB no tiene datos."""
     try:
@@ -109,11 +99,11 @@ def cargar_fallback_redistribucion(limit: Optional[int] = None) -> List[Dict[str
                 continue
             out.append({
                 "id": r.get("id") or i,
-                "camion": r.get("camion") or r.get("CAMION") or r.get("camion_asignado"),
-                "nombre": r.get("nombre") or r.get("NOMBRE") or r.get("jefe_hogar") or r.get("jefe"),
-                "dia": r.get("dia_asignado") or r.get("dia") or r.get("DIA"),
-                "litros": r.get("litros") or r.get("LITROS") or r.get("litros_de_entrega"),
-                "telefono": r.get("telefono") or r.get("TELEFONO") or r.get("phone"),
+                "camion": r.get("camion") or r.get("CAMION") or r.get("camion_asignado") or "Sin asignar",
+                "nombre": r.get("nombre") or r.get("NOMBRE") or r.get("jefe_hogar") or r.get("jefe") or "Desconocido",
+                "dia": r.get("dia_asignado") or r.get("dia") or r.get("DIA") or "N/D",
+                "litros": r.get("litros") or r.get("LITROS") or r.get("litros_de_entrega") or 0,
+                "telefono": r.get("telefono") or r.get("TELEFONO") or r.get("phone") or "N/D",
                 "latitud": float(lat),
                 "longitud": float(lon),
             })
@@ -123,6 +113,105 @@ def cargar_fallback_redistribucion(limit: Optional[int] = None) -> List[Dict[str
     except Exception as e:
         log.warning("Fallback JSON de redistribución no disponible: %s", e)
         return []
+
+# -----------------------------------------------------------------------------
+# Helpers de DB para Redistribución / Entregas App
+# -----------------------------------------------------------------------------
+def ensure_table_redistribucion() -> None:
+    """Crea la tabla de redistribución si no existe."""
+    with get_conn_cursor() as (_, cur):
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS redistribucion (
+              id SERIAL PRIMARY KEY,
+              camion    TEXT,
+              nombre    TEXT,
+              dia       TEXT,
+              litros    DOUBLE PRECISION,
+              telefono  TEXT,
+              latitud   DOUBLE PRECISION,
+              longitud  DOUBLE PRECISION
+            );
+        """)
+
+
+def count_redistribucion() -> int:
+    with get_conn_cursor() as (_, cur):
+        cur.execute("SELECT COUNT(1) AS c FROM redistribucion;")
+        row = cur.fetchone()
+        return int(row["c"] if row and "c" in row else 0)
+
+
+def seed_redistribucion_from_fallback(limit: Optional[int] = None) -> int:
+    """Carga el fallback JSON a la DB si hay datos y devuelve cuántos insertó."""
+    datos = cargar_fallback_redistribucion(limit=limit)
+    if not datos:
+        return 0
+    norm = []
+    for d in datos:
+        norm.append((
+            d.get("camion") or "Sin asignar",
+            d.get("nombre") or "Desconocido",
+            d.get("dia") or "N/D",
+            float(d.get("litros") or 0),
+            d.get("telefono") or "N/D",
+            float(d["latitud"]),
+            float(d["longitud"]),
+        ))
+    with get_conn_cursor() as (_, cur):
+        cur.execute("SET LOCAL statement_timeout TO 3000;")
+        execute_values(cur, """
+            INSERT INTO redistribucion
+            (camion, nombre, dia, litros, telefono, latitud, longitud)
+            VALUES %s
+        """, norm)
+        return len(norm)
+
+
+def ensure_table_entregas_app() -> None:
+    """Evita el 500 de /entregas-app creando la tabla si faltaba."""
+    with get_conn_cursor() as (_, cur):
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS entregas_app (
+              id SERIAL PRIMARY KEY,
+              nombre   TEXT,
+              camion   TEXT,
+              litros   INTEGER,
+              estado   INTEGER,
+              fecha    TIMESTAMP,
+              foto_url TEXT,
+              latitud  DOUBLE PRECISION,
+              longitud DOUBLE PRECISION
+            );
+        """)
+
+# -----------------------------------------------------------------------------
+# Eventos app
+# -----------------------------------------------------------------------------
+@app.on_event("startup")
+def startup() -> None:
+    global pool
+    log.info("Inicializando pool de conexiones…")
+    pool = SimpleConnectionPool(minconn=1, maxconn=8, dsn=DB_URL)
+
+    # Asegura tablas y, si redistribución está vacía, siembra desde el JSON
+    try:
+        ensure_table_redistribucion()
+        ensure_table_entregas_app()
+        if count_redistribucion() == 0:
+            ins = seed_redistribucion_from_fallback()
+            log.info("Redistribución inicial cargada desde JSON: %s filas.", ins)
+        else:
+            log.info("Redistribución ya tiene datos en DB.")
+    except Exception as e:
+        log.warning("Boot DB incompleto: %s", e)
+
+
+@app.on_event("shutdown")
+def shutdown() -> None:
+    global pool
+    if pool:
+        log.info("Cerrando pool de conexiones…")
+        pool.closeall()
 
 # -----------------------------------------------------------------------------
 # Modelos
@@ -137,6 +226,7 @@ class EditarRutaPayload(BaseModel):
     longitud: Optional[float] = None
     nombre: Optional[str] = None
     nombre_lookup: Optional[str] = None
+
 
 class EditarRedistribucionPayload(BaseModel):
     id: Optional[int] = Field(None)
@@ -171,6 +261,7 @@ def obtener_rutas_activas() -> List[Dict[str, Any]]:
             return cur.fetchall()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.put("/editar-ruta")
 def editar_ruta(payload: EditarRutaPayload):
@@ -222,9 +313,10 @@ def editar_ruta(payload: EditarRutaPayload):
 # -----------------------------------------------------------------------------
 @app.get("/redistribucion")
 def obtener_redistribucion() -> List[Dict[str, Any]]:
-    # 1) Intento DB
+    # 1) Intento DB rápido (máx 3s)
     try:
         with get_conn_cursor() as (_, cur):
+            cur.execute("SET LOCAL statement_timeout TO 3000;")
             cur.execute("""
                 SELECT id, camion, nombre, dia, litros, telefono, latitud, longitud
                 FROM redistribucion
@@ -236,11 +328,12 @@ def obtener_redistribucion() -> List[Dict[str, Any]]:
     except Exception as e:
         log.warning("DB error en /redistribucion, probando fallback JSON: %s", e)
 
-    # 2) Fallback JSON (solo lectura)
+    # 2) Fallback JSON (solo lectura si DB vacía o falla)
     datos = cargar_fallback_redistribucion()
     if datos:
         log.info("Usando fallback JSON para /redistribucion (%s registros).", len(datos))
     return datos
+
 
 @app.get("/redistribucion/source")
 def redistribucion_source():
@@ -252,6 +345,7 @@ def redistribucion_source():
     except Exception:
         pass
     return {"source": "json"}
+
 
 @app.put("/editar-redistribucion")
 def editar_redistribucion(payload: EditarRedistribucionPayload):
@@ -297,6 +391,17 @@ def editar_redistribucion(payload: EditarRedistribucionPayload):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# -----------------------------------------------------------------------------
+# Admin: bootstrap manual (opcional)
+# -----------------------------------------------------------------------------
+@app.post("/admin/bootstrap-redistribucion")
+def admin_bootstrap_redistribucion(limit: Optional[int] = None):
+    ensure_table_redistribucion()
+    if count_redistribucion() > 0:
+        return {"ok": True, "msg": "La tabla ya tiene datos; no se insertó nada."}
+    inserted = seed_redistribucion_from_fallback(limit=limit)
+    return {"ok": True, "insertados": inserted}
 
 # -----------------------------------------------------------------------------
 # Exportar Excel (rutas activas)
@@ -346,6 +451,7 @@ def eliminar_ficticio():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.get("/eliminar-nulos")
 def eliminar_nulos():
     try:
@@ -377,6 +483,7 @@ def obtener_entregas_app():
             return cur.fetchall()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/entregas-app")
 def registrar_entrega_app(
