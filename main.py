@@ -501,3 +501,28 @@ try:
         log.info("Router '/rutas-activas-excel' cargado")
 except Exception as e:
     log.warning("No se pudo cargar router /rutas-activas-excel: %s", e)
+    # -----------------------------------------------------------------------------
+# Registrar nuevo punto en RUTA ACTIVA
+# -----------------------------------------------------------------------------
+@app.post("/registrar-nuevo-punto")
+def registrar_nuevo_punto(
+    nombre: str = Form(...),
+    camion: str = Form(...),
+    dia: str = Form(...),
+    litros: float = Form(...),
+    telefono: Optional[str] = Form(None),
+    latitud: Optional[float] = Form(None),
+    longitud: Optional[float] = Form(None),
+):
+    try:
+        with get_conn_cursor() as (_, cur):
+            cur.execute("""
+                INSERT INTO ruta_activa (nombre, camion, dia, litros, telefono, latitud, longitud)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+            """, (nombre, camion, dia, litros, telefono, latitud, longitud))
+            new_id = cur.fetchone()["id"]
+        return {"mensaje": "✅ Nuevo punto agregado correctamente", "id": new_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
