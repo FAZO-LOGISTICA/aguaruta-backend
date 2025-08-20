@@ -1,8 +1,11 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File
+# main.py
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from typing import Dict
 import psycopg2
 from psycopg2.pool import SimpleConnectionPool
+from psycopg2.extras import execute_values
 from contextlib import contextmanager
 import pandas as pd
 import io
@@ -17,16 +20,21 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise ValueError("❌ DATABASE_URL no está configurada en variables de entorno")
 
+# Render requiere SSL
 pool = SimpleConnectionPool(
     1, 20, dsn=DATABASE_URL, sslmode="require"
 )
 
-app = FastAPI()
+app = FastAPI(title="AguaRuta API", version="2.0")
 
-# CORS para Netlify
+# CORS (Netlify + local dev)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://aguaruta.netlify.app"],
+    allow_origins=[
+        "https://aguaruta.netlify.app",
+        "http://localhost:3000",
+        "http://localhost:5173",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -48,8 +56,19 @@ def get_conn_cursor():
     finally:
         pool.putconn(conn)
 
+def _rows_to_dicts(cur, rows):
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, r)) for r in rows]
+
 # -----------------------------------------------------------------------------
-# ENDPOINTS RUTAS ACTIVAS
+# Salud
+# -----------------------------------------------------------------------------
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+# -----------------------------------------------------------------------------
+# RUTA ACTIVA — listar / editar
 # -----------------------------------------------------------------------------
 @app.get("/rutas-activas")
 def obtener_rutas_activas():
@@ -58,75 +77,114 @@ def obtener_rutas_activas():
             cur.execute("""
                 SELECT id, camion, nombre, dia, litros, telefono, latitud, longitud
                 FROM ruta_activa
+                ORDER BY camion, dia, nombre
             """)
             filas = cur.fetchall()
-            cols = [desc[0] for desc in cur.description]
-        return [dict(zip(cols, fila)) for fila in filas]
+            return _rows_to_dicts(cur, filas)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.put("/rutas-activas/{id}")
-def editar_ruta_activa(id: int, data: dict):
+def editar_ruta_activa(id: int, data: Dict):
+    """
+    Body JSON con las claves a actualizar. Ej:
+    { "camion":"A5", "dia":"Martes", "latitud":-33.1, "longitud":-71.5 }
+    """
     try:
-        with get_conn_cursor() as (conn, cur):
+        if not data:
+            raise HTTPException(status_code=400, detail="Body vacío")
+        with get_conn_cursor() as (_, cur):
             sets = ", ".join([f"{k} = %s" for k in data.keys()])
             values = list(data.values()) + [id]
             cur.execute(f"UPDATE ruta_activa SET {sets} WHERE id = %s", values)
             if cur.rowcount == 0:
                 raise HTTPException(status_code=404, detail="Registro no encontrado")
-        return {"mensaje": "✅ Registro actualizado correctamente"}
+        return {"mensaje": "✅ Registro actualizado correctamente", "id": id}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 # -----------------------------------------------------------------------------
-# ENDPOINTS REDISTRIBUCIÓN
+# IMPORTAR **RUTA ACTIVA** desde CSV/XLSX (reemplaza todo)
 # -----------------------------------------------------------------------------
-@app.get("/redistribucion")
-def obtener_redistribucion():
+@app.post("/admin/importar-ruta-activa-file")
+def importar_ruta_activa_file(
+    archivo: UploadFile = File(...),
+    truncate: bool = Form(True),
+):
+    """
+    Sube un CSV/XLSX y carga DIRECTO en ruta_activa.
+    Columnas aceptadas (en cualquier orden y con alias):
+      camion | nombre | litros | latitud | longitud | dia (o dia_asignado) | telefono
+    - Reemplaza comas decimales por punto.
+    - Ignora vacíos (no rompe).
+    - Si truncate=True (default), limpia ruta_activa antes de insertar.
+    """
     try:
+        content = archivo.file.read()
+        nombre = archivo.filename.lower()
+
+        # Leer archivo a DataFrame
+        if nombre.endswith(".xlsx"):
+            df = pd.read_excel(io.BytesIO(content), dtype=str)
+        elif nombre.endswith(".csv"):
+            # primero UTF-8, si no Latin-1
+            try:
+                df = pd.read_csv(io.BytesIO(content), dtype=str, encoding="utf-8")
+            except Exception:
+                df = pd.read_csv(io.BytesIO(content), dtype=str, encoding="latin-1")
+        else:
+            raise HTTPException(status_code=400, detail="Formato no soportado. Sube .csv o .xlsx")
+
+        # Normalizar nombres de columnas
+        df.columns = [c.strip().lower() for c in df.columns]
+
+        def pick(df, col, *alts):
+            for c in (col, *alts):
+                if c in df.columns:
+                    return df[c]
+            return None
+
+        # Seleccionar y mapear a columnas de ruta_activa
+        out = pd.DataFrame({
+            "camion":   pick(df, "camion"),
+            "nombre":   pick(df, "nombre", "jefe_hogar"),
+            "dia":      pick(df, "dia", "dia_asignado"),
+            "litros":   pick(df, "litros", "litros_de_entrega"),
+            "telefono": pick(df, "telefono", "phone"),
+            "latitud":  pick(df, "latitud", "lat", "latitude"),
+            "longitud": pick(df, "longitud", "lon", "lng", "longitude"),
+        })
+
+        # Limpiar/tipar
+        for c in ["latitud", "longitud", "litros"]:
+            out[c] = pd.to_numeric(out[c].astype(str).str.replace(",", ".", regex=False), errors="coerce")
+        for c in ["camion", "nombre", "dia", "telefono"]:
+            out[c] = out[c].astype(str).str.strip().replace({"nan": None, "None": None, "": None})
+        out = out.where(pd.notnull(out), None)
+
+        # Convertir a lista de tuplas
+        rows = list(out.itertuples(index=False, name=None))
+        if not rows:
+            raise HTTPException(status_code=400, detail="Archivo sin filas útiles")
+
         with get_conn_cursor() as (_, cur):
-            cur.execute("""
-                SELECT id, camion, nombre, dia, litros, telefono, latitud, longitud
-                FROM redistribucion
-            """)
-            filas = cur.fetchall()
-            cols = [desc[0] for desc in cur.description]
-        return [dict(zip(cols, fila)) for fila in filas]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+            if truncate:
+                cur.execute("TRUNCATE TABLE ruta_activa;")
+            execute_values(cur, """
+                INSERT INTO ruta_activa (camion, nombre, dia, litros, telefono, latitud, longitud)
+                VALUES %s
+            """, rows)
 
-@app.post("/redistribucion")
-def cargar_redistribucion(file: UploadFile = File(...)):
-    try:
-        # Guardar archivo temporal
-        temp_path = f"temp_{datetime.now().strftime('%Y%m%d%H%M%S')}.xlsx"
-        with open(temp_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-
-        df = pd.read_excel(temp_path)
-        os.remove(temp_path)
-
-        # Limpiar tabla redistribucion
-        with get_conn_cursor() as (_, cur):
-            cur.execute("TRUNCATE TABLE redistribucion;")
-
-        # Insertar nuevos datos
-        with get_conn_cursor() as (_, cur):
-            for _, row in df.iterrows():
-                cur.execute("""
-                    INSERT INTO redistribucion (camion, nombre, dia, litros, telefono, latitud, longitud)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                """, (
-                    row["camion"], row["nombre"], row["dia"], row["litros"],
-                    row.get("telefono"), row.get("latitud"), row.get("longitud")
-                ))
-
-        return {"mensaje": f"✅ Redistribución cargada con {len(df)} registros."}
+        return {"ok": True, "insertados": len(rows)}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 # -----------------------------------------------------------------------------
-# EXPORTAR A EXCEL
+# EXPORTAR RUTA ACTIVA a Excel
 # -----------------------------------------------------------------------------
 @app.get("/exportar-excel")
 def exportar_excel():
@@ -135,12 +193,12 @@ def exportar_excel():
             cur.execute("""
                 SELECT camion, nombre, dia, litros, telefono, latitud, longitud
                 FROM ruta_activa
+                ORDER BY camion, dia, nombre
             """)
             filas = cur.fetchall()
-            cols = [desc[0] for desc in cur.description]
+            cols = [d[0] for d in cur.description]
 
         df = pd.DataFrame(filas, columns=cols)
-
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
             df.to_excel(writer, index=False, sheet_name="Rutas Activas")
@@ -155,10 +213,45 @@ def exportar_excel():
         raise HTTPException(status_code=500, detail=str(e))
 
 # -----------------------------------------------------------------------------
-# REGISTRAR ENTREGA DESDE APP MÓVIL
+# REGISTRAR NUEVO PUNTO (Ruta Activa) — JSON body
 # -----------------------------------------------------------------------------
+@app.post("/registrar-nuevo-punto")
+def registrar_nuevo_punto(data: Dict):
+    try:
+        with get_conn_cursor() as (_, cur):
+            cur.execute("""
+                INSERT INTO ruta_activa (camion, nombre, dia, litros, telefono, latitud, longitud)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+            """, (
+                data.get("camion"), data.get("nombre"), data.get("dia"),
+                data.get("litros"), data.get("telefono"),
+                data.get("latitud"), data.get("longitud")
+            ))
+            new_id = cur.fetchone()[0]
+        return {"mensaje": "✅ Nuevo punto registrado en ruta activa", "id": new_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# -----------------------------------------------------------------------------
+# ENTREGAS APP (historial y registro)
+# -----------------------------------------------------------------------------
+@app.get("/entregas-app")
+def obtener_entregas_app():
+    try:
+        with get_conn_cursor() as (_, cur):
+            cur.execute("""
+                SELECT nombre, camion, litros, estado, fecha, latitud, longitud, foto
+                FROM entregas_app
+                ORDER BY fecha DESC
+            """)
+            filas = cur.fetchall()
+            return _rows_to_dicts(cur, filas)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/entregas-app")
-async def registrar_entrega(data: dict):
+def registrar_entrega_app(data: Dict):
     try:
         with get_conn_cursor() as (_, cur):
             cur.execute("""
@@ -174,53 +267,24 @@ async def registrar_entrega(data: dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 # -----------------------------------------------------------------------------
-# LIMPIAR TABLAS
+# Limpieza
 # -----------------------------------------------------------------------------
 @app.post("/limpiar-tablas")
 def limpiar_tablas():
+    """Limpia SOLO ruta_activa (ya no usamos redistribucion)."""
     try:
         with get_conn_cursor() as (_, cur):
             cur.execute("TRUNCATE TABLE ruta_activa;")
-            cur.execute("TRUNCATE TABLE redistribucion;")
-        return {"mensaje": "✅ Tablas limpiadas"}
+        return {"mensaje": "✅ Tabla ruta_activa limpiada"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# -----------------------------------------------------------------------------
-# REGISTRAR NUEVO PUNTO
-# -----------------------------------------------------------------------------
-@app.post("/registrar-nuevo-punto")
-def registrar_nuevo_punto(data: dict):
+@app.post("/admin/drop-redistribucion")
+def drop_redistribucion():
+    """Opcional: elimina la tabla redistribucion si existe (para simplificar el sistema)."""
     try:
         with get_conn_cursor() as (_, cur):
-            cur.execute("""
-                INSERT INTO ruta_activa (camion, nombre, dia, litros, telefono, latitud, longitud)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-            """, (
-                data.get("camion"), data.get("nombre"), data.get("dia"),
-                data.get("litros"), data.get("telefono"),
-                data.get("latitud"), data.get("longitud")
-            ))
-        return {"mensaje": "✅ Nuevo punto registrado en ruta activa"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# -----------------------------------------------------------------------------
-# ACTIVAR REDISTRIBUCIÓN (NUEVO)
-# -----------------------------------------------------------------------------
-@app.post("/activar-redistribucion")
-def activar_redistribucion():
-    try:
-        with get_conn_cursor() as (_, cur):
-            # 1. Vaciar ruta_activa
-            cur.execute("TRUNCATE TABLE ruta_activa;")
-            # 2. Copiar redistribucion -> ruta_activa
-            cur.execute("""
-                INSERT INTO ruta_activa (camion, nombre, dia, litros, telefono, latitud, longitud)
-                SELECT camion, nombre, dia, litros, telefono, latitud, longitud
-                FROM redistribucion
-            """)
-            insertados = cur.rowcount
-        return {"mensaje": f"✅ Redistribución activada: {insertados} registros movidos a ruta_activa."}
+            cur.execute("DROP TABLE IF EXISTS redistribucion;")
+        return {"mensaje": "✅ Tabla redistribucion eliminada (si existía)"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
