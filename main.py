@@ -118,7 +118,7 @@ def _norm_dia(d) -> Optional[str]:
 
 def _valid_lat_lon(lat, lon) -> bool:
     if lat is None or lon is None:
-        return True  # opcional
+        return True
     try:
         return (-90.0 <= float(lat) <= 90.0) and (-180.0 <= float(lon) <= 180.0)
     except Exception:
@@ -132,8 +132,8 @@ def health():
     return {"status": "ok"}
 
 # -----------------------------------------------------------------------------
-# Compatibilidad: /redistribucion (para front actual)  -> lee JSON en backend/data
-#   Si no existe el archivo, devuelve [] (no 404) para no ensuciar el front.
+# Compatibilidad: /redistribucion (para front actual) -> lee JSON en backend/data
+# Si no existe el archivo, devuelve [] (no 404) para no ensuciar el front.
 # -----------------------------------------------------------------------------
 def _norm_row_json(r: dict) -> dict:
     return {
@@ -149,7 +149,7 @@ def _norm_row_json(r: dict) -> dict:
 @app.get("/redistribucion")
 def redistribucion_compat(camion: Optional[str] = None, dia: Optional[str] = None):
     if not DATA_FILE_REDIS.exists():
-        return []  # silencioso
+        return []
     try:
         raw = json.loads(DATA_FILE_REDIS.read_text(encoding="utf-8")) or []
     except Exception:
@@ -202,6 +202,55 @@ def editar_ruta_activa(id: int, data: Dict):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# -----------------------------------------------------------------------------
+# COMPAT — el front viejo llama PUT /editar-ruta (sin {id})
+# -----------------------------------------------------------------------------
+@app.put("/editar-ruta")
+def editar_ruta_legacy(payload: Dict):
+    try:
+        rid = payload.get("id") or payload.get("ID") or payload.get("Id")
+        if not rid:
+            raise HTTPException(status_code=400, detail="Falta 'id' en el payload")
+
+        allowed = {"camion","nombre","dia","litros","telefono","latitud","longitud"}
+        data = {k.lower(): v for k, v in payload.items() if k.lower() in allowed}
+
+        def fixnum(x, kind="float"):
+            if x is None:
+                return None
+            s = str(x).strip().replace(",", ".")
+            try:
+                return int(float(s)) if kind == "int" else float(s)
+            except Exception:
+                return None
+
+        if "litros"   in data: data["litros"]   = fixnum(data["litros"], "int")
+        if "latitud"  in data: data["latitud"]  = fixnum(data["latitud"], "float")
+        if "longitud" in data: data["longitud"] = fixnum(data["longitud"], "float")
+
+        if not data:
+            raise HTTPException(status_code=400, detail="Sin campos para actualizar")
+
+        with get_conn_cursor() as (_, cur):
+            sets = ", ".join([f"{k} = %s" for k in data.keys()])
+            values = list(data.values()) + [rid]
+            cur.execute(f"UPDATE ruta_activa SET {sets} WHERE id = %s", values)
+            if cur.rowcount == 0:
+                raise HTTPException(status_code=404, detail="Registro no encontrado")
+
+        return {"ok": True, "id": rid, "mensaje": "✅ Registro actualizado"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# (opcional) también acepta /editar-ruta/{id}
+@app.put("/editar-ruta/{id}")
+def editar_ruta_legacy_with_id(id: int, payload: Dict):
+    payload = dict(payload or {})
+    payload["id"] = id
+    return editar_ruta_legacy(payload)
 
 # -----------------------------------------------------------------------------
 # IMPORTAR **RUTA ACTIVA** desde CSV/XLSX (reemplaza todo)
@@ -379,9 +428,7 @@ def aplicar_nueva_redistribucion(
     - Agrupa por 'nombre' (mismo hogar) y evita conflictos de asignación.
     - Preserva M3 si 'preservar_m3' = True.
     - Si 'truncate_only_if_valid' y no hay filas válidas, no vacía la tabla.
-    Devuelve resumen con insertados/omitidos y motivos.
     """
-    # 1) Fuente
     fuente = []
     if items and isinstance(items, list):
         fuente = items
@@ -412,7 +459,6 @@ def aplicar_nueva_redistribucion(
     motivos: Dict[str, int] = {}
     muestras_errores: List[Dict] = []
 
-    # 2) Normalización + validación por fila
     crudos_validos: List[Dict] = []
     for idx, row in enumerate(fuente):
         if not isinstance(row, dict):
@@ -474,7 +520,6 @@ def aplicar_nueva_redistribucion(
             "longitud": longitud
         })
 
-    # 3) Agrupar por hogar (nombre) y evitar conflictos de asignación
     grupos: Dict[str, Dict] = {}
     for item in crudos_validos:
         key = item["nombre"]
@@ -501,12 +546,9 @@ def aplicar_nueva_redistribucion(
     insertados = 0
     preservados_m3 = 0
 
-    # 4) Transacción segura
     try:
         with get_conn_cursor() as (_, cur):
-            # Si no hay válidas y está activo "truncate_only_if_valid", NO vaciamos la tabla
             if truncate and (filas_validas or not truncate_only_if_valid):
-                # Preservar M3 antes de truncar
                 preserva_rows = []
                 if preservar_m3:
                     cur.execute("""
@@ -517,17 +559,14 @@ def aplicar_nueva_redistribucion(
                     preserva_rows = cur.fetchall() or []
                     preservados_m3 = len(preserva_rows)
 
-                # Vaciamos
                 cur.execute("TRUNCATE TABLE ruta_activa;")
 
-                # Reinsertar M3 (intacto)
                 if preservar_m3 and preserva_rows:
                     execute_values(cur, """
                         INSERT INTO ruta_activa (camion, nombre, dia, litros, telefono, latitud, longitud)
                         VALUES %s
                     """, preserva_rows)
 
-            # Insertar nuevas válidas (si hay)
             if filas_validas:
                 rows = [
                     (r["camion"], r["nombre"], r["dia"], r["litros"], r.get("telefono"), r.get("latitud"), r.get("longitud"))
