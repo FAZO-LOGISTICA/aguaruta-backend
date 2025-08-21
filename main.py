@@ -10,6 +10,11 @@ import pandas as pd
 import io
 import os
 from datetime import datetime
+from typing import List, Dict, Optional
+from fastapi import Body
+from pathlib import Path
+import json
+import unicodedata
 
 # === Routers ===
 # Asegúrate de tener un __init__.py vacío dentro de backend/routers/
