@@ -1,4 +1,3 @@
-# main.py
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -10,8 +9,12 @@ from contextlib import contextmanager
 import pandas as pd
 import io
 import os
-import shutil
 from datetime import datetime
+
+# === Routers ===
+# Asegúrate de tener un __init__.py vacío dentro de backend/routers/
+from routers import redistribucion_legacy      # -> expone /redistribucion (para el front actual)
+from routers import redistribucion as nueva_redistribucion  # -> tus endpoints /nueva-distribucion/...
 
 # -----------------------------------------------------------------------------
 # Configuración inicial
@@ -39,6 +42,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# === Montar routers ===
+app.include_router(redistribucion_legacy.router)       # /redistribucion (+ /redistribucion/health)
+app.include_router(nueva_redistribucion.router)        # /nueva-distribucion/*
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -117,19 +124,14 @@ def importar_ruta_activa_file(
     Sube un CSV/XLSX y carga DIRECTO en ruta_activa.
     Columnas aceptadas (en cualquier orden y con alias):
       camion | nombre | litros | latitud | longitud | dia (o dia_asignado) | telefono
-    - Reemplaza comas decimales por punto.
-    - Ignora vacíos (no rompe).
-    - Si truncate=True (default), limpia ruta_activa antes de insertar.
     """
     try:
         content = archivo.file.read()
         nombre = archivo.filename.lower()
 
-        # Leer archivo a DataFrame
         if nombre.endswith(".xlsx"):
             df = pd.read_excel(io.BytesIO(content), dtype=str)
         elif nombre.endswith(".csv"):
-            # primero UTF-8, si no Latin-1
             try:
                 df = pd.read_csv(io.BytesIO(content), dtype=str, encoding="utf-8")
             except Exception:
@@ -137,7 +139,6 @@ def importar_ruta_activa_file(
         else:
             raise HTTPException(status_code=400, detail="Formato no soportado. Sube .csv o .xlsx")
 
-        # Normalizar nombres de columnas
         df.columns = [c.strip().lower() for c in df.columns]
 
         def pick(df, col, *alts):
@@ -146,7 +147,6 @@ def importar_ruta_activa_file(
                     return df[c]
             return None
 
-        # Seleccionar y mapear a columnas de ruta_activa
         out = pd.DataFrame({
             "camion":   pick(df, "camion"),
             "nombre":   pick(df, "nombre", "jefe_hogar"),
@@ -157,14 +157,12 @@ def importar_ruta_activa_file(
             "longitud": pick(df, "longitud", "lon", "lng", "longitude"),
         })
 
-        # Limpiar/tipar
         for c in ["latitud", "longitud", "litros"]:
             out[c] = pd.to_numeric(out[c].astype(str).str.replace(",", ".", regex=False), errors="coerce")
         for c in ["camion", "nombre", "dia", "telefono"]:
             out[c] = out[c].astype(str).str.strip().replace({"nan": None, "None": None, "": None})
         out = out.where(pd.notnull(out), None)
 
-        # Convertir a lista de tuplas
         rows = list(out.itertuples(index=False, name=None))
         if not rows:
             raise HTTPException(status_code=400, detail="Archivo sin filas útiles")
