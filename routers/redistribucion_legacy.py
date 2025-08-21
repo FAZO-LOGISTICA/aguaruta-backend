@@ -1,4 +1,3 @@
-# backend/routers/redistribucion_legacy.py
 from fastapi import APIRouter, HTTPException, Query
 from pathlib import Path
 import json
