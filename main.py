@@ -25,7 +25,7 @@ if not DATABASE_URL:
 # Render requiere SSL
 pool = SimpleConnectionPool(1, 20, dsn=DATABASE_URL, sslmode="require")
 
-app = FastAPI(title="AguaRuta API", version="2.0")
+app = FastAPI(title="AguaRuta API", version="2.1")
 
 # CORS (Netlify + local dev)
 app.add_middleware(
@@ -61,7 +61,7 @@ def _rows_to_dicts(cur, rows):
     return [dict(zip(cols, r)) for r in rows]
 
 # -----------------------------------------------------------------------------
-# Helpers de normalización / redistribución
+# Helpers de normalización / redistribución (solo lectura para vistas)
 # -----------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -118,7 +118,7 @@ def _norm_dia(d) -> Optional[str]:
 
 def _valid_lat_lon(lat, lon) -> bool:
     if lat is None or lon is None:
-        return True
+        return True  # opcional
     try:
         return (-90.0 <= float(lat) <= 90.0) and (-180.0 <= float(lon) <= 180.0)
     except Exception:
@@ -132,7 +132,7 @@ def health():
     return {"status": "ok"}
 
 # -----------------------------------------------------------------------------
-# Compatibilidad: /redistribucion (para front actual) -> lee JSON en backend/data
+# Compatibilidad: /redistribucion (para front de mapas) -> lee JSON en backend/data
 # Si no existe el archivo, devuelve [] (no 404) para no ensuciar el front.
 # -----------------------------------------------------------------------------
 def _norm_row_json(r: dict) -> dict:
@@ -245,7 +245,6 @@ def editar_ruta_legacy(payload: Dict):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# (opcional) también acepta /editar-ruta/{id}
 @app.put("/editar-ruta/{id}")
 def editar_ruta_legacy_with_id(id: int, payload: Dict):
     payload = dict(payload or {})
@@ -411,202 +410,21 @@ def registrar_entrega_app(data: Dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 # -----------------------------------------------------------------------------
-# ACTIVAR NUEVA REDISTRIBUCIÓN (vuelca a tabla ruta_activa) — tolerante a errores
+# NUEVA DISTRIBUCIÓN: DESHABILITADA
 # -----------------------------------------------------------------------------
 @app.post("/nueva-distribucion/aplicar")
-def aplicar_nueva_redistribucion(
+def aplicar_nueva_redistribucion_deprecated(
     items: Optional[List[Dict]] = Body(default=None),
     preservar_m3: bool = True,
     truncate: bool = True,
     truncate_only_if_valid: bool = True,
-    source: str = "file"  # "file" usa backend/data/RutasMapaFinal_con_telefono.json si items=None
+    source: str = "file",
 ):
-    """
-    Aplica redistribución a la tabla ruta_activa SIN reventar por filas malas.
-    - Lee 'items' del body o, si no hay, desde data/RutasMapaFinal_con_telefono.json.
-    - Valida por fila: omite errores (no 500).
-    - Agrupa por 'nombre' (mismo hogar) y evita conflictos de asignación.
-    - Preserva M3 si 'preservar_m3' = True.
-    - Si 'truncate_only_if_valid' y no hay filas válidas, no vacía la tabla.
-    """
-    fuente = []
-    if items and isinstance(items, list):
-        fuente = items
-    elif source == "file":
-        if not DATA_FILE_REDIS.exists():
-            return {
-                "ok": False,
-                "mensaje": f"Sin cambios: no existe {DATA_FILE_REDIS.name} en backend/data/",
-                "insertados": 0, "omitidos": 0, "total_leidos": 0, "motivos_omision": {}
-            }
-        try:
-            with open(DATA_FILE_REDIS, "r", encoding="utf-8") as f:
-                fuente = json.load(f) or []
-        except Exception:
-            return {
-                "ok": False,
-                "mensaje": "Sin cambios: no se pudo leer/parsear el JSON de redistribución.",
-                "insertados": 0, "omitidos": 0, "total_leidos": 0, "motivos_omision": {"json_invalido": 1}
-            }
-    else:
-        return {
-            "ok": False,
-            "mensaje": "Sin cambios: no se entregaron items y 'source' != 'file'.",
-            "insertados": 0, "omitidos": 0, "total_leidos": 0, "motivos_omision": {}
-        }
-
-    total_leidos = len(fuente)
-    motivos: Dict[str, int] = {}
-    muestras_errores: List[Dict] = []
-
-    crudos_validos: List[Dict] = []
-    for idx, row in enumerate(fuente):
-        if not isinstance(row, dict):
-            motivos["fila_no_dict"] = motivos.get("fila_no_dict", 0) + 1
-            if len(muestras_errores) < 10:
-                muestras_errores.append({"fila": idx, "motivo": "fila_no_dict"})
-            continue
-
-        dn = _norm_dict(row)
-        camion = _pick(dn, "camion", "id_camion")
-        nombre = _pick(dn, "nombre")
-        dia = _norm_dia(_pick(dn, "dia", "dia_asignado", "día"))
-        litros = _parse_int_pos(_pick(dn, "litros", "litros_de_entrega", "litros_entrega"))
-        telefono = _pick(dn, "telefono", "fono")
-        latitud = _parse_float(_pick(dn, "latitud", "lat"))
-        longitud = _parse_float(_pick(dn, "longitud", "lon", "lng"))
-
-        if not nombre:
-            motivos["sin_nombre"] = motivos.get("sin_nombre", 0) + 1
-            if len(muestras_errores) < 10:
-                muestras_errores.append({"fila": idx, "motivo": "sin_nombre"})
-            continue
-        if not camion:
-            motivos["sin_camion"] = motivos.get("sin_camion", 0) + 1
-            if len(muestras_errores) < 10:
-                muestras_errores.append({"fila": idx, "motivo": "sin_camion", "nombre": nombre})
-            continue
-        if str(camion).upper() == "M3":
-            motivos["m3_excluido"] = motivos.get("m3_excluido", 0) + 1
-            continue
-        if str(camion).upper() not in CAMIONES_VALIDOS:
-            motivos["camion_no_permitido"] = motivos.get("camion_no_permitido", 0) + 1
-            if len(muestras_errores) < 10:
-                muestras_errores.append({"fila": idx, "motivo": "camion_no_permitido", "camion": camion, "nombre": nombre})
-            continue
-        if not dia:
-            motivos["dia_invalido"] = motivos.get("dia_invalido", 0) + 1
-            if len(muestras_errores) < 10:
-                muestras_errores.append({"fila": idx, "motivo": "dia_invalido", "nombre": nombre})
-            continue
-        if litros is None or litros <= 0:
-            motivos["litros_invalidos"] = motivos.get("litros_invalidos", 0) + 1
-            if len(muestras_errores) < 10:
-                muestras_errores.append({"fila": idx, "motivo": "litros_invalidos", "nombre": nombre})
-            continue
-        if not _valid_lat_lon(latitud, longitud):
-            motivos["coord_invalidas"] = motivos.get("coord_invalidas", 0) + 1
-            if len(muestras_errores) < 10:
-                muestras_errores.append({"fila": idx, "motivo": "coord_invalidas", "nombre": nombre})
-            continue
-
-        crudos_validos.append({
-            "camion": str(camion).upper(),
-            "nombre": str(nombre).strip(),
-            "dia": dia,
-            "litros": litros,
-            "telefono": telefono if telefono not in ("nan", "") else None,
-            "latitud": latitud,
-            "longitud": longitud
-        })
-
-    grupos: Dict[str, Dict] = {}
-    for item in crudos_validos:
-        key = item["nombre"]
-        g = grupos.get(key)
-        if not g:
-            grupos[key] = {**item}
-            continue
-        if g["camion"] == item["camion"] and g["dia"] == item["dia"]:
-            g["litros"] += item["litros"]
-            if not g.get("telefono"): g["telefono"] = item.get("telefono")
-            if g.get("latitud") is None: g["latitud"] = item.get("latitud")
-            if g.get("longitud") is None: g["longitud"] = item.get("longitud")
-        else:
-            motivos["conflicto_asignacion"] = motivos.get("conflicto_asignacion", 0) + 1
-            if len(muestras_errores) < 10:
-                muestras_errores.append({
-                    "motivo": "conflicto_asignacion",
-                    "nombre": key,
-                    "previo": {"camion": g["camion"], "dia": g["dia"]},
-                    "nuevo": {"camion": item["camion"], "dia": item["dia"]}
-                })
-
-    filas_validas = list(grupos.values())
-    insertados = 0
-    preservados_m3 = 0
-
-    try:
-        with get_conn_cursor() as (_, cur):
-            if truncate and (filas_validas or not truncate_only_if_valid):
-                preserva_rows = []
-                if preservar_m3:
-                    cur.execute("""
-                        SELECT camion, nombre, dia, litros, telefono, latitud, longitud
-                        FROM ruta_activa
-                        WHERE UPPER(camion) = 'M3'
-                    """)
-                    preserva_rows = cur.fetchall() or []
-                    preservados_m3 = len(preserva_rows)
-
-                cur.execute("TRUNCATE TABLE ruta_activa;")
-
-                if preservar_m3 and preserva_rows:
-                    execute_values(cur, """
-                        INSERT INTO ruta_activa (camion, nombre, dia, litros, telefono, latitud, longitud)
-                        VALUES %s
-                    """, preserva_rows)
-
-            if filas_validas:
-                rows = [
-                    (r["camion"], r["nombre"], r["dia"], r["litros"], r.get("telefono"), r.get("latitud"), r.get("longitud"))
-                    for r in filas_validas
-                ]
-                execute_values(cur, """
-                    INSERT INTO ruta_activa (camion, nombre, dia, litros, telefono, latitud, longitud)
-                    VALUES %s
-                """, rows)
-                insertados = len(rows)
-
-    except Exception as e:
-        return {
-            "ok": False,
-            "mensaje": f"Error en activación (transacción): {str(e)}",
-            "total_leidos": total_leidos,
-            "insertados": insertados,
-            "omitidos": total_leidos - len(crudos_validos) + motivos.get("conflicto_asignacion", 0),
-            "motivos_omision": motivos,
-            "muestras_errores": muestras_errores[:10],
-            "preservados_m3": preservados_m3
-        }
-
-    ok = True
-    mensaje = "Redistribución aplicada"
-    if insertados == 0 and truncate_only_if_valid and truncate:
-        ok = False
-        mensaje = "Sin cambios: 0 filas válidas (no se aplicó truncado)."
-
-    return {
-        "ok": ok,
-        "mensaje": mensaje,
-        "total_leidos": total_leidos,
-        "validados": len(crudos_validos),
-        "insertados": insertados,
-        "omitidos": total_leidos - len(crudos_validos) + motivos.get("conflicto_asignacion", 0),
-        "motivos_omision": motivos,
-        "muestras_errores": muestras_errores[:10],
-        "preservados_m3": preservados_m3
-    }
+    # 410 Gone: funcionalidad retirada
+    raise HTTPException(
+        status_code=410,
+        detail="Endpoint deshabilitado: 'Nueva Distribución' fue retirada del sistema."
+    )
 
 # -----------------------------------------------------------------------------
 # Limpieza
