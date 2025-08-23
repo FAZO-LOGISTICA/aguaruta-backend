@@ -9,6 +9,7 @@ from psycopg2.extras import execute_values
 import pandas as pd
 import io
 import os
+import math  # ✅ para Haversine
 
 # -----------------------------------------------------------------------------
 # Configuración inicial
@@ -20,7 +21,7 @@ if not DATABASE_URL:
 # Render requiere SSL
 pool = SimpleConnectionPool(1, 20, dsn=DATABASE_URL, sslmode="require")
 
-app = FastAPI(title="AguaRuta API", version="2.3.1")
+app = FastAPI(title="AguaRuta API", version="2.4.0")
 
 # CORS (Netlify + local dev)
 app.add_middleware(
@@ -54,6 +55,43 @@ def get_conn_cursor():
 def _rows_to_dicts(cur, rows):
     cols = [d[0] for d in cur.description]
     return [dict(zip(cols, r)) for r in rows]
+
+# -----------------------------------------------------------------------------
+# Helpers numéricos y geo
+# -----------------------------------------------------------------------------
+def _to_float_or_none(x):
+    if x is None or x == "":
+        return None
+    try:
+        return float(str(x).strip().replace(",", "."))
+    except Exception:
+        return None
+
+def _to_int_or_none(x):
+    v = _to_float_or_none(x)
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except Exception:
+        return None
+
+def _valid_lat_lon(lat, lon) -> bool:
+    try:
+        return (-90.0 <= float(lat) <= 90.0) and (-180.0 <= float(lon) <= 180.0)
+    except Exception:
+        return False
+
+def _haversine_km(lat1, lon1, lat2, lon2) -> float:
+    """Distancia en km entre (lat1,lon1) y (lat2,lon2) usando Haversine."""
+    R = 6371.0
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat/2)**2 + math.cos(p1) * math.cos(p2) * math.sin(dlon/2)**2
+    c = 2 * math.asin(math.sqrt(a))
+    return R * c
 
 # -----------------------------------------------------------------------------
 # Salud
@@ -113,18 +151,9 @@ def editar_ruta_legacy(payload: Dict):
         allowed = {"camion", "nombre", "dia", "litros", "telefono", "latitud", "longitud"}
         data = {k.lower(): v for k, v in (payload or {}).items() if k.lower() in allowed}
 
-        def fixnum(x, kind="float"):
-            if x is None or x == "":
-                return None
-            s = str(x).strip().replace(",", ".")
-            try:
-                return int(float(s)) if kind == "int" else float(s)
-            except Exception:
-                return None
-
-        if "litros"   in data: data["litros"]   = fixnum(data["litros"], "int")
-        if "latitud"  in data: data["latitud"]  = fixnum(data["latitud"], "float")
-        if "longitud" in data: data["longitud"] = fixnum(data["longitud"], "float")
+        if "litros"   in data: data["litros"]   = _to_int_or_none(data["litros"])
+        if "latitud"  in data: data["latitud"]  = _to_float_or_none(data["latitud"])
+        if "longitud" in data: data["longitud"] = _to_float_or_none(data["longitud"])
 
         if not data:
             raise HTTPException(status_code=400, detail="Sin campos para actualizar")
@@ -253,7 +282,7 @@ def exportar_excel():
         raise HTTPException(status_code=500, detail=str(e))
 
 # -----------------------------------------------------------------------------
-# REGISTRAR NUEVO PUNTO (Ruta Activa) — JSON body
+# REGISTRAR NUEVO PUNTO (manual)
 # -----------------------------------------------------------------------------
 @app.post("/registrar-nuevo-punto")
 def registrar_nuevo_punto(data: Dict):
@@ -270,6 +299,80 @@ def registrar_nuevo_punto(data: Dict):
             ))
             new_id = cur.fetchone()[0]
         return {"mensaje": "✅ Nuevo punto registrado en ruta activa", "id": new_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# -----------------------------------------------------------------------------
+# REGISTRAR NUEVO PUNTO (auto-asignación por proximidad)
+# -----------------------------------------------------------------------------
+@app.post("/registrar-nuevo-punto-auto")
+def registrar_nuevo_punto_auto(data: Dict):
+    """
+    Inserta un nuevo punto auto-asignando el CAMION y el DIA en base al punto más cercano de ruta_activa.
+    Requiere: nombre, litros, latitud, longitud (telefono y dia son opcionales).
+    """
+    try:
+        nombre = (data.get("nombre") or "").strip()
+        litros = _to_int_or_none(data.get("litros"))
+        telefono = (data.get("telefono") or None)
+
+        lat = _to_float_or_none(data.get("latitud"))
+        lon = _to_float_or_none(data.get("longitud"))
+        dia_in = (data.get("dia") or None)
+
+        if not nombre:
+            raise HTTPException(status_code=400, detail="Falta 'nombre'")
+        if litros is None or litros <= 0:
+            raise HTTPException(status_code=400, detail="'litros' inválido")
+        if lat is None or lon is None or not _valid_lat_lon(lat, lon):
+            raise HTTPException(status_code=400, detail="Coordenadas inválidas")
+
+        # Buscar punto más cercano existente
+        with get_conn_cursor() as (_, cur):
+            cur.execute("""
+                SELECT id, camion, dia, latitud, longitud
+                FROM ruta_activa
+                WHERE camion IS NOT NULL
+                  AND latitud IS NOT NULL
+                  AND longitud IS NOT NULL
+            """)
+            filas = cur.fetchall() or []
+
+            mejor = None  # (dist_km, camion, dia, id_ref)
+            for (rid, camion_ref, dia_ref, lat_ref, lon_ref) in filas:
+                try:
+                    dkm = _haversine_km(lat, lon, float(lat_ref), float(lon_ref))
+                except Exception:
+                    continue
+                if (mejor is None) or (dkm < mejor[0]):
+                    mejor = (dkm, str(camion_ref).upper() if camion_ref else None, dia_ref, rid)
+
+            if mejor:
+                dist_km, camion_sel, dia_sel, ref_id = mejor
+                camion_final = camion_sel or "A1"
+                dia_final = dia_in or dia_sel  # prioriza día enviado; si no, usa del vecino
+                ref = {"id_ref": ref_id, "dist_km": round(dist_km, 3)}
+            else:
+                camion_final = "A1"
+                dia_final = dia_in
+                ref = {"id_ref": None, "dist_km": None}
+
+            cur.execute("""
+                INSERT INTO ruta_activa (camion, nombre, dia, litros, telefono, latitud, longitud)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+            """, (camion_final, nombre, dia_final, litros, telefono, lat, lon))
+            new_id = cur.fetchone()[0]
+
+        return {
+            "ok": True,
+            "mensaje": "✅ Punto registrado y asignado por proximidad",
+            "id": new_id,
+            "asignacion": {"camion": camion_final, "dia": dia_final},
+            "referencia": ref,
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -319,8 +422,7 @@ def listar_entregas(
     """
     Devuelve entregas filtradas por rango de fechas y/o estado/camion.
     - desde/hasta: YYYY-MM-DD (se comparan contra fecha::date)
-    - estado: coincide exacto (case-insensitive)
-    - camion: coincide exacto (case-insensitive)
+    - estado y camion: match case-insensitive exacto
     """
     try:
         where = []
