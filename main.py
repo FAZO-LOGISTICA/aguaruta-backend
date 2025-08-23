@@ -1,19 +1,14 @@
 # backend/main.py
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Body
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 from contextlib import contextmanager
 from psycopg2.pool import SimpleConnectionPool
 from psycopg2.extras import execute_values
-import psycopg2
 import pandas as pd
-from pathlib import Path
-import unicodedata
 import io
 import os
-import json
-from datetime import datetime
 
 # -----------------------------------------------------------------------------
 # Configuración inicial
@@ -25,7 +20,7 @@ if not DATABASE_URL:
 # Render requiere SSL
 pool = SimpleConnectionPool(1, 20, dsn=DATABASE_URL, sslmode="require")
 
-app = FastAPI(title="AguaRuta API", version="2.1")
+app = FastAPI(title="AguaRuta API", version="2.2")
 
 # CORS (Netlify + local dev)
 app.add_middleware(
@@ -61,109 +56,11 @@ def _rows_to_dicts(cur, rows):
     return [dict(zip(cols, r)) for r in rows]
 
 # -----------------------------------------------------------------------------
-# Helpers de normalización / redistribución (solo lectura para vistas)
-# -----------------------------------------------------------------------------
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-DATA_FILE_REDIS = DATA_DIR / "RutasMapaFinal_con_telefono.json"
-CAMIONES_VALIDOS = {"A1", "A2", "A3", "A4", "A5", "M1", "M2"}  # M3 se preserva, no se reasigna
-
-def _strip_accents(s: str) -> str:
-    return "".join(c for c in unicodedata.normalize("NFD", str(s)) if unicodedata.category(c) != "Mn")
-
-def _norm_key(k: str) -> str:
-    return _strip_accents(k).lower().replace(" ", "_")
-
-def _norm_dict(d: dict) -> dict:
-    return {_norm_key(k): v for k, v in d.items()}
-
-def _pick(dn: dict, *candidatos, default=None):
-    for k in candidatos:
-        if k in dn and dn[k] not in (None, "", "nan"):
-            return dn[k]
-    return default
-
-def _parse_float(x):
-    if x is None:
-        return None
-    try:
-        s = str(x).strip().replace(",", ".")
-        return float(s)
-    except Exception:
-        return None
-
-def _parse_int_pos(x):
-    try:
-        f = _parse_float(x)
-        return int(f) if f is not None and f > 0 else None
-    except Exception:
-        return None
-
-_DIAS = {
-    "LUN": "LUNES", "LUNES": "LUNES",
-    "MAR": "MARTES", "MARTES": "MARTES",
-    "MIE": "MIERCOLES", "MIERCOLES": "MIERCOLES", "MIÉRCOLES": "MIERCOLES",
-    "JUE": "JUEVES", "JUEVES": "JUEVES",
-    "VIE": "VIERNES", "VIERNES": "VIERNES"
-}
-
-def _norm_dia(d) -> Optional[str]:
-    if not d:
-        return None
-    t = _strip_accents(str(d)).strip().upper()
-    if t in _DIAS:
-        return _DIAS[t]
-    pref = t[:3]
-    return _DIAS.get(pref, None)
-
-def _valid_lat_lon(lat, lon) -> bool:
-    if lat is None or lon is None:
-        return True  # opcional
-    try:
-        return (-90.0 <= float(lat) <= 90.0) and (-180.0 <= float(lon) <= 180.0)
-    except Exception:
-        return False
-
-# -----------------------------------------------------------------------------
 # Salud
 # -----------------------------------------------------------------------------
 @app.get("/health")
 def health():
     return {"status": "ok"}
-
-# -----------------------------------------------------------------------------
-# Compatibilidad: /redistribucion (para front de mapas) -> lee JSON en backend/data
-# Si no existe el archivo, devuelve [] (no 404) para no ensuciar el front.
-# -----------------------------------------------------------------------------
-def _norm_row_json(r: dict) -> dict:
-    return {
-        "camion": r.get("camion") or r.get("CAMION") or r.get("id_camion"),
-        "nombre": r.get("nombre") or r.get("NOMBRE"),
-        "latitud": r.get("latitud") or r.get("LATITUD"),
-        "longitud": r.get("longitud") or r.get("LONGITUD"),
-        "litros": r.get("litros") or r.get("LITROS_DE_ENTREGA") or r.get("litros_entrega"),
-        "dia": r.get("dia") or r.get("DIA") or r.get("dia_asignado"),
-        "telefono": r.get("telefono") or r.get("TELEFONO") or r.get("fono"),
-    }
-
-@app.get("/redistribucion")
-def redistribucion_compat(camion: Optional[str] = None, dia: Optional[str] = None):
-    if not DATA_FILE_REDIS.exists():
-        return []
-    try:
-        raw = json.loads(DATA_FILE_REDIS.read_text(encoding="utf-8")) or []
-    except Exception:
-        return []
-    rows = [_norm_row_json(x) for x in raw if isinstance(x, dict)]
-    if camion:
-        rows = [r for r in rows if (r.get("camion") or "").upper() == camion.upper()]
-    if dia:
-        rows = [r for r in rows if (r.get("dia") or "").upper() == dia.upper()]
-    return rows
-
-@app.get("/redistribucion/health")
-def redistribucion_health():
-    return {"ok": True}
 
 # -----------------------------------------------------------------------------
 # RUTA ACTIVA — listar / editar
@@ -186,7 +83,7 @@ def obtener_rutas_activas():
 def editar_ruta_activa(id: int, data: Dict):
     """
     Body JSON con las claves a actualizar. Ej:
-    { "camion":"A5", "dia":"Martes", "latitud":-33.1, "longitud":-71.5 }
+    { "camion":"A5", "dia":"MARTES", "latitud":-33.1, "longitud":-71.5 }
     """
     try:
         if not data:
@@ -204,7 +101,7 @@ def editar_ruta_activa(id: int, data: Dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 # -----------------------------------------------------------------------------
-# COMPAT — el front viejo llama PUT /editar-ruta (sin {id})
+# COMPAT — algunos frontends llaman PUT /editar-ruta (sin {id})
 # -----------------------------------------------------------------------------
 @app.put("/editar-ruta")
 def editar_ruta_legacy(payload: Dict):
@@ -213,11 +110,11 @@ def editar_ruta_legacy(payload: Dict):
         if not rid:
             raise HTTPException(status_code=400, detail="Falta 'id' en el payload")
 
-        allowed = {"camion","nombre","dia","litros","telefono","latitud","longitud"}
-        data = {k.lower(): v for k, v in payload.items() if k.lower() in allowed}
+        allowed = {"camion", "nombre", "dia", "litros", "telefono", "latitud", "longitud"}
+        data = {k.lower(): v for k, v in (payload or {}).items() if k.lower() in allowed}
 
         def fixnum(x, kind="float"):
-            if x is None:
+            if x is None or x == "":
                 return None
             s = str(x).strip().replace(",", ".")
             try:
@@ -410,28 +307,11 @@ def registrar_entrega_app(data: Dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 # -----------------------------------------------------------------------------
-# NUEVA DISTRIBUCIÓN: DESHABILITADA
-# -----------------------------------------------------------------------------
-@app.post("/nueva-distribucion/aplicar")
-def aplicar_nueva_redistribucion_deprecated(
-    items: Optional[List[Dict]] = Body(default=None),
-    preservar_m3: bool = True,
-    truncate: bool = True,
-    truncate_only_if_valid: bool = True,
-    source: str = "file",
-):
-    # 410 Gone: funcionalidad retirada
-    raise HTTPException(
-        status_code=410,
-        detail="Endpoint deshabilitado: 'Nueva Distribución' fue retirada del sistema."
-    )
-
-# -----------------------------------------------------------------------------
-# Limpieza
+# Limpieza / utilidades
 # -----------------------------------------------------------------------------
 @app.post("/limpiar-tablas")
 def limpiar_tablas():
-    """Limpia SOLO ruta_activa (ya no usamos redistribucion)."""
+    """Limpia SOLO ruta_activa."""
     try:
         with get_conn_cursor() as (_, cur):
             cur.execute("TRUNCATE TABLE ruta_activa;")
@@ -441,7 +321,7 @@ def limpiar_tablas():
 
 @app.post("/admin/drop-redistribucion")
 def drop_redistribucion():
-    """Opcional: elimina la tabla redistribucion si existe (para simplificar el sistema)."""
+    """Opcional: elimina la tabla redistribucion si existe (por si quedó de versiones antiguas)."""
     try:
         with get_conn_cursor() as (_, cur):
             cur.execute("DROP TABLE IF EXISTS redistribucion;")
