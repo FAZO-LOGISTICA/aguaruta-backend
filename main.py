@@ -20,7 +20,7 @@ if not DATABASE_URL:
 # Render requiere SSL
 pool = SimpleConnectionPool(1, 20, dsn=DATABASE_URL, sslmode="require")
 
-app = FastAPI(title="AguaRuta API", version="2.3")
+app = FastAPI(title="AguaRuta API", version="2.3.1")
 
 # CORS (Netlify + local dev)
 app.add_middleware(
@@ -221,7 +221,7 @@ def importar_ruta_activa_file(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail:str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 # -----------------------------------------------------------------------------
 # EXPORTAR RUTA ACTIVA a Excel
@@ -308,8 +308,6 @@ def registrar_entrega_app(data: Dict):
 
 # -----------------------------------------------------------------------------
 # SHIM de compatibilidad: /entregas y /entregas/no-entregadas
-#   El front llama /entregas?desde=YYYY-MM-DD&hasta=YYYY-MM-DD
-#   Leemos desde la tabla entregas_app y devolvemos columnas conocidas.
 # -----------------------------------------------------------------------------
 @app.get("/entregas")
 def listar_entregas(
@@ -393,7 +391,7 @@ def listar_no_entregadas(
             rows = cur.fetchall()
             return _rows_to_dicts(cur, rows)
     except Exception as e:
-        raise HTTPException(status_code=500, detail:str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 # -----------------------------------------------------------------------------
 # Limpieza / utilidades
@@ -406,7 +404,7 @@ def limpiar_tablas():
             cur.execute("TRUNCATE TABLE ruta_activa;")
         return {"mensaje": "✅ Tabla ruta_activa limpiada"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail:str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/admin/drop-redistribucion")
 def drop_redistribucion():
@@ -416,4 +414,4 @@ def drop_redistribucion():
             cur.execute("DROP TABLE IF EXISTS redistribucion;")
         return {"mensaje": "✅ Tabla redistribucion eliminada (si existía)"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail:str(e))
+        raise HTTPException(status_code=500, detail=str(e))
