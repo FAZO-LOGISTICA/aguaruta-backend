@@ -2,7 +2,7 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 from contextlib import contextmanager
 from psycopg2.pool import SimpleConnectionPool
 from psycopg2.extras import execute_values
@@ -20,7 +20,7 @@ if not DATABASE_URL:
 # Render requiere SSL
 pool = SimpleConnectionPool(1, 20, dsn=DATABASE_URL, sslmode="require")
 
-app = FastAPI(title="AguaRuta API", version="2.2")
+app = FastAPI(title="AguaRuta API", version="2.3")
 
 # CORS (Netlify + local dev)
 app.add_middleware(
@@ -221,7 +221,7 @@ def importar_ruta_activa_file(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail:str(e))
 
 # -----------------------------------------------------------------------------
 # EXPORTAR RUTA ACTIVA a Excel
@@ -307,6 +307,95 @@ def registrar_entrega_app(data: Dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 # -----------------------------------------------------------------------------
+# SHIM de compatibilidad: /entregas y /entregas/no-entregadas
+#   El front llama /entregas?desde=YYYY-MM-DD&hasta=YYYY-MM-DD
+#   Leemos desde la tabla entregas_app y devolvemos columnas conocidas.
+# -----------------------------------------------------------------------------
+@app.get("/entregas")
+def listar_entregas(
+    desde: Optional[str] = None,
+    hasta: Optional[str] = None,
+    estado: Optional[str] = None,
+    camion: Optional[str] = None,
+):
+    """
+    Devuelve entregas filtradas por rango de fechas y/o estado/camion.
+    - desde/hasta: YYYY-MM-DD (se comparan contra fecha::date)
+    - estado: coincide exacto (case-insensitive)
+    - camion: coincide exacto (case-insensitive)
+    """
+    try:
+        where = []
+        params: List[str] = []
+
+        if desde:
+            where.append("fecha::date >= %s")
+            params.append(desde)
+        if hasta:
+            where.append("fecha::date <= %s")
+            params.append(hasta)
+        if estado:
+            where.append("UPPER(estado) = UPPER(%s)")
+            params.append(estado)
+        if camion:
+            where.append("UPPER(camion) = UPPER(%s)")
+            params.append(camion)
+
+        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+        sql = f"""
+            SELECT nombre, camion, litros, estado, fecha, latitud, longitud, foto
+            FROM entregas_app
+            {where_sql}
+            ORDER BY fecha DESC
+        """
+
+        with get_conn_cursor() as (_, cur):
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+            return _rows_to_dicts(cur, rows)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/entregas/no-entregadas")
+def listar_no_entregadas(
+    desde: Optional[str] = None,
+    hasta: Optional[str] = None,
+    camion: Optional[str] = None,
+):
+    """
+    Atajo para 'no entregadas'.
+    Considera cualquier estado que comience con 'NO' (NO ENTREGADO/NO ENTREGADA).
+    """
+    try:
+        where = ["UPPER(estado) LIKE 'NO%'"]
+        params: List[str] = []
+
+        if desde:
+            where.append("fecha::date >= %s")
+            params.append(desde)
+        if hasta:
+            where.append("fecha::date <= %s")
+            params.append(hasta)
+        if camion:
+            where.append("UPPER(camion) = UPPER(%s)")
+            params.append(camion)
+
+        where_sql = "WHERE " + " AND ".join(where)
+        sql = f"""
+            SELECT nombre, camion, litros, estado, fecha, latitud, longitud, foto
+            FROM entregas_app
+            {where_sql}
+            ORDER BY fecha DESC
+        """
+
+        with get_conn_cursor() as (_, cur):
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+            return _rows_to_dicts(cur, rows)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail:str(e))
+
+# -----------------------------------------------------------------------------
 # Limpieza / utilidades
 # -----------------------------------------------------------------------------
 @app.post("/limpiar-tablas")
@@ -317,7 +406,7 @@ def limpiar_tablas():
             cur.execute("TRUNCATE TABLE ruta_activa;")
         return {"mensaje": "✅ Tabla ruta_activa limpiada"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail:str(e))
 
 @app.post("/admin/drop-redistribucion")
 def drop_redistribucion():
@@ -327,4 +416,4 @@ def drop_redistribucion():
             cur.execute("DROP TABLE IF EXISTS redistribucion;")
         return {"mensaje": "✅ Tabla redistribucion eliminada (si existía)"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail:str(e))
