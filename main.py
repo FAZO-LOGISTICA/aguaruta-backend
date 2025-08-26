@@ -1,7 +1,8 @@
 # backend/main.py
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from typing import Dict, Optional, List
 from contextlib import contextmanager
 from psycopg2.pool import SimpleConnectionPool
@@ -9,19 +10,25 @@ from psycopg2.extras import execute_values
 import pandas as pd
 import io
 import os
-import math  # ✅ para Haversine
+import math
+import uuid
+from datetime import datetime
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Configuración inicial
-# -----------------------------------------------------------------------------
+# =============================================================================
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise ValueError("❌ DATABASE_URL no está configurada en variables de entorno")
 
+# Carpeta para evidencias de entregas de la app
+UPLOAD_DIR = os.getenv("ENTREGAS_UPLOAD_DIR", "uploads/entregas")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
 # Render requiere SSL
 pool = SimpleConnectionPool(1, 20, dsn=DATABASE_URL, sslmode="require")
 
-app = FastAPI(title="AguaRuta API", version="2.4.0")
+app = FastAPI(title="AguaRuta API", version="2.5.0")
 
 # CORS (Netlify + local dev)
 app.add_middleware(
@@ -36,9 +43,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# -----------------------------------------------------------------------------
+# Servir archivos subidos (fotos) en /uploads
+# Ej: /uploads/entregas/<archivo>.jpg
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+
+# =============================================================================
 # Helpers DB
-# -----------------------------------------------------------------------------
+# =============================================================================
 @contextmanager
 def get_conn_cursor():
     conn = pool.getconn()
@@ -56,9 +67,9 @@ def _rows_to_dicts(cur, rows):
     cols = [d[0] for d in cur.description]
     return [dict(zip(cols, r)) for r in rows]
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Helpers numéricos y geo
-# -----------------------------------------------------------------------------
+# =============================================================================
 def _to_float_or_none(x):
     if x is None or x == "":
         return None
@@ -93,16 +104,36 @@ def _haversine_km(lat1, lon1, lat2, lon2) -> float:
     c = 2 * math.asin(math.sqrt(a))
     return R * c
 
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Reglas de estado (foto requerida/prohibida)
+# =============================================================================
+VALID_STATES = {1, 2, 3, 4}
+# 1 Entregado (opcional), 2 No está (requiere), 3 Dirección no existe (prohibida),
+# 4 Camino malo (requiere)
+def _foto_required(estado: int) -> bool:
+    return estado in (2, 4)
+
+def _foto_forbidden(estado: int) -> bool:
+    return estado == 3
+
+def _parse_fecha(fecha_str: str) -> str:
+    # Acepta "YYYY-MM-DD" y retorna ISO (YYYY-MM-DD) o lanza error
+    try:
+        dt = datetime.strptime(fecha_str, "%Y-%m-%d")
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        raise HTTPException(status_code=400, detail="fecha inválida, use YYYY-MM-DD")
+
+# =============================================================================
 # Salud
-# -----------------------------------------------------------------------------
+# =============================================================================
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # RUTA ACTIVA — listar / editar
-# -----------------------------------------------------------------------------
+# =============================================================================
 @app.get("/rutas-activas")
 def obtener_rutas_activas():
     try:
@@ -177,9 +208,9 @@ def editar_ruta_legacy_with_id(id: int, payload: Dict):
     payload["id"] = id
     return editar_ruta_legacy(payload)
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # IMPORTAR **RUTA ACTIVA** desde CSV/XLSX (reemplaza todo)
-# -----------------------------------------------------------------------------
+# =============================================================================
 @app.post("/admin/importar-ruta-activa-file")
 def importar_ruta_activa_file(
     archivo: UploadFile = File(...),
@@ -252,9 +283,9 @@ def importar_ruta_activa_file(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # EXPORTAR RUTA ACTIVA a Excel
-# -----------------------------------------------------------------------------
+# =============================================================================
 @app.get("/exportar-excel")
 def exportar_excel():
     try:
@@ -281,9 +312,9 @@ def exportar_excel():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # REGISTRAR NUEVO PUNTO (manual)
-# -----------------------------------------------------------------------------
+# =============================================================================
 @app.post("/registrar-nuevo-punto")
 def registrar_nuevo_punto(data: Dict):
     try:
@@ -302,9 +333,9 @@ def registrar_nuevo_punto(data: Dict):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # REGISTRAR NUEVO PUNTO (auto-asignación por proximidad)
-# -----------------------------------------------------------------------------
+# =============================================================================
 @app.post("/registrar-nuevo-punto-auto")
 def registrar_nuevo_punto_auto(data: Dict):
     """
@@ -376,36 +407,116 @@ def registrar_nuevo_punto_auto(data: Dict):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # ENTREGAS APP (historial y registro)
-# -----------------------------------------------------------------------------
+# =============================================================================
 @app.get("/entregas-app")
-def obtener_entregas_app():
+def obtener_entregas_app(
+    camion: Optional[str] = None,
+    fecha: Optional[str] = None,   # YYYY-MM-DD
+    estado: Optional[int] = None,  # 1..4
+):
+    """
+    Lista entregas de la app con filtros opcionales.
+    - fecha filtra por fecha exacta (YYYY-MM-DD)
+    - estado: 1..4
+    - camion: texto exacto (A1, A2, ...)
+    """
     try:
+        where = []
+        params: List = []
+
+        if fecha:
+            where.append("fecha::date = %s")
+            params.append(_parse_fecha(fecha))
+        if estado is not None:
+            where.append("estado = %s")
+            params.append(int(estado))
+        if camion:
+            where.append("UPPER(camion) = UPPER(%s)")
+            params.append(camion)
+
+        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+        sql = f"""
+            SELECT nombre, camion, litros, estado, fecha, latitud, longitud, foto
+            FROM entregas_app
+            {where_sql}
+            ORDER BY fecha DESC
+        """
+
         with get_conn_cursor() as (_, cur):
-            cur.execute("""
-                SELECT nombre, camion, litros, estado, fecha, latitud, longitud, foto
-                FROM entregas_app
-                ORDER BY fecha DESC
-            """)
+            cur.execute(sql, params)
             filas = cur.fetchall()
             return _rows_to_dicts(cur, filas)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/entregas-app")
-def registrar_entrega_app(data: Dict):
+async def registrar_entrega_app(
+    nombre: str = Form(...),
+    camion: str = Form(...),
+    litros: int = Form(...),
+    estado: int = Form(...),      # 1,2,3,4
+    fecha: str = Form(...),       # YYYY-MM-DD
+    lat: float = Form(...),
+    lon: float = Form(...),
+    foto: UploadFile | None = File(None),
+):
+    """
+    Registra entrega desde la app (multipart/form-data).
+    - Guarda foto en disco cuando corresponde y almacena la ruta en columna 'foto'.
+    - Valida reglas de foto según estado (1 opcional, 2 requiere, 3 prohibida, 4 requiere).
+    """
     try:
+        # Validaciones
+        if int(estado) not in VALID_STATES:
+            raise HTTPException(status_code=400, detail="estado inválido (use 1,2,3,4)")
+
+        fecha_iso = _parse_fecha(fecha)
+
+        if not _valid_lat_lon(lat, lon):
+            raise HTTPException(status_code=400, detail="Coordenadas inválidas")
+
+        if _foto_required(int(estado)) and foto is None:
+            raise HTTPException(status_code=400, detail="Se requiere foto para estado 2 o 4.")
+        if _foto_forbidden(int(estado)) and foto is not None:
+            raise HTTPException(status_code=400, detail="No se permite foto para estado 3.")
+
+        # Guardar foto si viene
+        foto_rel_path = None
+        if foto is not None:
+            ext = os.path.splitext(foto.filename or "")[1].lower()
+            if ext not in [".jpg", ".jpeg", ".png", ".webp"]:
+                raise HTTPException(status_code=400, detail="Formato de imagen no permitido.")
+            file_id = f"{uuid.uuid4().hex}{ext}"
+            target_path = os.path.join(UPLOAD_DIR, file_id)
+            os.makedirs(os.path.dirname(target_path), exist_ok=True)
+            with open(target_path, "wb") as f:
+                f.write(await foto.read())
+            # Guardamos la ruta relativa que es servible por /uploads
+            foto_rel_path = os.path.join("entregas", file_id).replace("\\", "/")
+
+        # Insertar
         with get_conn_cursor() as (_, cur):
             cur.execute("""
                 INSERT INTO entregas_app (nombre, camion, litros, estado, fecha, latitud, longitud, foto)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING nombre, camion, litros, estado, fecha, latitud, longitud, foto
             """, (
-                data.get("nombre"), data.get("camion"), data.get("litros"),
-                data.get("estado"), data.get("fecha"),
-                data.get("latitud"), data.get("longitud"), data.get("foto")
+                nombre, camion, int(litros), int(estado), fecha_iso,
+                float(lat), float(lon), foto_rel_path
             ))
-        return {"mensaje": "✅ Entrega registrada correctamente"}
+            row = cur.fetchone()
+
+        return {"ok": True, "data": {
+            "nombre": row[0], "camion": row[1], "litros": row[2], "estado": row[3],
+            "fecha": str(row[4]), "latitud": row[5], "longitud": row[6],
+            "foto": row[7], "foto_url": (f"/uploads/{row[7]}" if row[7] else None)
+        }}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -416,27 +527,28 @@ def registrar_entrega_app(data: Dict):
 def listar_entregas(
     desde: Optional[str] = None,
     hasta: Optional[str] = None,
-    estado: Optional[str] = None,
+    estado: Optional[int] = None,   # 1..4
     camion: Optional[str] = None,
 ):
     """
-    Devuelve entregas filtradas por rango de fechas y/o estado/camion.
+    Devuelve entregas filtradas por rango de fechas y/o estado/camion (datos de la app).
     - desde/hasta: YYYY-MM-DD (se comparan contra fecha::date)
-    - estado y camion: match case-insensitive exacto
+    - estado: 1..4
+    - camion: match case-insensitive exacto
     """
     try:
         where = []
-        params: List[str] = []
+        params: List = []
 
         if desde:
             where.append("fecha::date >= %s")
-            params.append(desde)
+            params.append(_parse_fecha(desde))
         if hasta:
             where.append("fecha::date <= %s")
-            params.append(hasta)
-        if estado:
-            where.append("UPPER(estado) = UPPER(%s)")
-            params.append(estado)
+            params.append(_parse_fecha(hasta))
+        if estado is not None:
+            where.append("estado = %s")
+            params.append(int(estado))
         if camion:
             where.append("UPPER(camion) = UPPER(%s)")
             params.append(camion)
@@ -463,19 +575,18 @@ def listar_no_entregadas(
     camion: Optional[str] = None,
 ):
     """
-    Atajo para 'no entregadas'.
-    Considera cualquier estado que comience con 'NO' (NO ENTREGADO/NO ENTREGADA).
+    Atajo para 'no entregadas' -> filtra estados 2,3,4 (datos de la app).
     """
     try:
-        where = ["UPPER(estado) LIKE 'NO%'"]
-        params: List[str] = []
+        where = ["estado IN (2,3,4)"]
+        params: List = []
 
         if desde:
             where.append("fecha::date >= %s")
-            params.append(desde)
+            params.append(_parse_fecha(desde))
         if hasta:
             where.append("fecha::date <= %s")
-            params.append(hasta)
+            params.append(_parse_fecha(hasta))
         if camion:
             where.append("UPPER(camion) = UPPER(%s)")
             params.append(camion)
@@ -495,9 +606,9 @@ def listar_no_entregadas(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Limpieza / utilidades
-# -----------------------------------------------------------------------------
+# =============================================================================
 @app.post("/limpiar-tablas")
 def limpiar_tablas():
     """Limpia SOLO ruta_activa."""
