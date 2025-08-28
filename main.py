@@ -25,7 +25,7 @@ if not DATABASE_URL:
 # Render requiere SSL
 pool = SimpleConnectionPool(1, 20, dsn=DATABASE_URL, sslmode="require")
 
-app = FastAPI(title="AguaRuta API", version="3.1.0")
+app = FastAPI(title="AguaRuta API", version="3.2.0")
 
 # CORS (Netlify + local dev + Expo)
 app.add_middleware(
@@ -133,12 +133,52 @@ def _get_first(data: Dict, *keys, cast="float"):
     return None
 
 # -----------------------------------------------------------------------------
+# Rutas/paths de datos (Excel oficial del mapa)
+# -----------------------------------------------------------------------------
+DATA_DIR = Path("data"); DATA_DIR.mkdir(parents=True, exist_ok=True)
+MAP_XLSX = DATA_DIR / "base_datos_todos_con_coordenadas.xlsx"  # nombre oficial
+
+def _sync_mapa_internal() -> Dict:
+    """
+    Toma puntos desde ruta_activa (solo con coordenadas válidas) y
+    escribe/actualiza el Excel oficial del mapa.
+    """
+    with get_conn_cursor() as (_, cur):
+        cur.execute("""
+            SELECT nombre, litros, telefono, latitud, longitud
+            FROM ruta_activa
+            WHERE latitud IS NOT NULL AND longitud IS NOT NULL
+        """)
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+
+    df = pd.DataFrame(rows, columns=cols)
+    if df.empty:
+        # mantiene archivo vacío/previo, pero retornamos estado
+        return {"ok": False, "puntos_exportados": 0, "archivo": str(MAP_XLSX)}
+
+    # Normalizar y validar (punto decimal, rangos)
+    for c in ["latitud", "longitud", "litros"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df[
+        df["latitud"].between(-90, 90) &
+        df["longitud"].between(-180, 180)
+    ]
+
+    # Escribir hoja "puntos" con columnas exactas usadas por el mapa
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(MAP_XLSX, engine="openpyxl") as w:
+        df.to_excel(w, index=False, sheet_name="puntos")
+
+    return {"ok": True, "puntos_exportados": int(len(df)), "archivo": str(MAP_XLSX)}
+
+# -----------------------------------------------------------------------------
 # Routers externos (FREE Cloudinary sign)
 # -----------------------------------------------------------------------------
 try:
     from routers.cloudinary import router as cloudinary_router
     app.include_router(cloudinary_router)
-except Exception as _e:
+except Exception:
     # Si no existe el archivo, no rompemos el servidor
     pass
 
@@ -196,6 +236,11 @@ def editar_ruta_activa(id: int, data: Dict):
             cur.execute(f"UPDATE ruta_activa SET {sets} WHERE id = %s", values)
             if cur.rowcount == 0:
                 raise HTTPException(status_code=404, detail="Registro no encontrado")
+        # 🔁 Autosync mapa (no bloqueante)
+        try:
+            _sync_mapa_internal()
+        except Exception:
+            pass
         return {"mensaje": "✅ Registro actualizado correctamente", "id": id}
     except HTTPException:
         raise
@@ -222,6 +267,11 @@ def editar_ruta_legacy(payload: Dict):
             cur.execute(f"UPDATE ruta_activa SET {sets} WHERE id = %s", values)
             if cur.rowcount == 0:
                 raise HTTPException(status_code=404, detail="Registro no encontrado")
+        # 🔁 Autosync mapa
+        try:
+            _sync_mapa_internal()
+        except Exception:
+            pass
         return {"ok": True, "id": rid, "mensaje": "✅ Registro actualizado"}
     except HTTPException:
         raise
@@ -291,11 +341,17 @@ def importar_ruta_activa_file(
                 VALUES %s
             """, rows)
 
+        # 🔁 Autosync mapa tras importar masivo
+        try:
+            _sync_mapa_internal()
+        except Exception:
+            pass
+
         return {"ok": True, "insertados": len(rows)}
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail:str(e))
 
 # -----------------------------------------------------------------------------
 # EXPORTAR RUTA ACTIVA a Excel
@@ -343,9 +399,14 @@ def registrar_nuevo_punto(data: Dict):
                 data.get("latitud"), data.get("longitud")
             ))
             new_id = cur.fetchone()[0]
+        # 🔁 Autosync
+        try:
+            _sync_mapa_internal()
+        except Exception:
+            pass
         return {"mensaje": "✅ Nuevo punto registrado en ruta activa", "id": new_id}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail:str(e))
 
 @app.post("/registrar-nuevo-punto-auto")
 def registrar_nuevo_punto_auto(data: Dict):
@@ -400,6 +461,12 @@ def registrar_nuevo_punto_auto(data: Dict):
             """, (camion_final, nombre, dia_final, litros, telefono, lat, lon))
             new_id = cur.fetchone()[0]
 
+        # 🔁 Autosync
+        try:
+            _sync_mapa_internal()
+        except Exception:
+            pass
+
         return {
             "ok": True,
             "mensaje": "✅ Punto registrado y asignado por proximidad",
@@ -410,7 +477,7 @@ def registrar_nuevo_punto_auto(data: Dict):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail:str(e))
 
 # -----------------------------------------------------------------------------
 # ENTREGAS APP (historial y registro)
@@ -427,13 +494,12 @@ def obtener_entregas_app():
             filas = cur.fetchall()
             return _rows_to_dicts(cur, filas)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail:str(e))
 
-# JSON (compat): ahora acepta lat/lon con varios alias (gps_lat/gps_lng incluidos)
+# JSON (compat): acepta alias gps_lat/gps_lng
 @app.post("/entregas-app")
 def registrar_entrega_json(data: Dict):
     try:
-        # Acepta múltiples claves desde la app móvil (free/offline-first)
         lat = _get_first(data, "latitud", "gps_lat", "lat")
         lon = _get_first(data, "longitud", "gps_lng", "lng", "lon")
         fecha_sql = data.get("fecha") or None
@@ -452,7 +518,7 @@ def registrar_entrega_json(data: Dict):
             ))
         return {"mensaje": "✅ Entrega registrada correctamente"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail:str(e))
 
 # MULTIPART (con foto real → guarda local si no usas Cloudinary)
 @app.post("/entregas-app-form")
@@ -483,7 +549,7 @@ async def registrar_entrega_form(
             ))
         return {"mensaje": "✅ Entrega registrada correctamente", "foto_url": foto_url}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail:str(e))
 
 # -----------------------------------------------------------------------------
 # SHIMs de listados
@@ -523,7 +589,7 @@ def listar_entregas(
             rows = cur.fetchall()
             return _rows_to_dicts(cur, rows)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail:str(e))
 
 @app.get("/entregas/no-entregadas")
 def listar_no_entregadas(
@@ -553,7 +619,7 @@ def listar_no_entregadas(
             rows = cur.fetchall()
             return _rows_to_dicts(cur, rows)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail:str(e))
 
 # -----------------------------------------------------------------------------
 # NUEVO: ESTADOS DEL DÍA (para pintar verde/rojo en la app)
@@ -565,14 +631,13 @@ def estados_del_dia(
     fecha: Optional[str] = None,
 ):
     """
-    Devuelve [{id, estado}] donde 'id' es el id en ruta_activa y 'estado' es 1|0|2|3
+    Devuelve [{id, estado}] donde 'id' es el id en ruta_activa y 'estado' es 1|0|2|3.
     Calcula el último estado del día (fecha::date) para cada (camion,nombre) y lo mapea a la ruta activa.
     Si 'dia' se envía, solo mapea sobre las rutas de ese día.
     """
     try:
         fecha_d = fecha or _today_str_tzcl()
         with get_conn_cursor() as (_, cur):
-            # base: rutas del camión (+día opcional)
             params_r = [camion]
             where_r = ["UPPER(camion) = UPPER(%s)"]
             if dia:
@@ -602,7 +667,7 @@ def estados_del_dia(
             filas = cur.fetchall()
             return [{"id": rid, "estado": est} for (rid, est) in filas]
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail:str(e))
 
 # -----------------------------------------------------------------------------
 # Limpieza / utilidades / migraciones simples
@@ -612,9 +677,14 @@ def limpiar_tablas():
     try:
         with get_conn_cursor() as (_, cur):
             cur.execute("TRUNCATE TABLE ruta_activa;")
+        # sync en blanco
+        try:
+            _sync_mapa_internal()
+        except Exception:
+            pass
         return {"mensaje": "✅ Tabla ruta_activa limpiada"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail:str(e))
 
 @app.post("/admin/drop-redistribucion")
 def drop_redistribucion():
@@ -658,4 +728,14 @@ def migrar_entregas_app():
             """)
         return {"ok": True, "mensaje": "✅ Migración aplicada (entregas_app)"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail:str(e))
+
+# -----------------------------------------------------------------------------
+# ✅ Nuevo endpoint público para sincronizar Excel del mapa
+# -----------------------------------------------------------------------------
+@app.post("/admin/sync-mapa")
+def sync_mapa():
+    try:
+        return _sync_mapa_internal()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail:str(e))
