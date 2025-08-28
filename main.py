@@ -25,7 +25,7 @@ if not DATABASE_URL:
 # Render requiere SSL
 pool = SimpleConnectionPool(1, 20, dsn=DATABASE_URL, sslmode="require")
 
-app = FastAPI(title="AguaRuta API", version="3.0.0")
+app = FastAPI(title="AguaRuta API", version="3.1.0")
 
 # CORS (Netlify + local dev + Expo)
 app.add_middleware(
@@ -42,7 +42,7 @@ app.add_middleware(
 )
 
 # -----------------------------------------------------------------------------
-# Archivos estáticos (fotos)
+# Archivos estáticos (fotos locales opcionales)
 # -----------------------------------------------------------------------------
 UPLOAD_ROOT = Path(os.getenv("UPLOAD_ROOT", "uploads")).resolve()
 UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
@@ -63,8 +63,7 @@ def _save_upload_file(f: UploadFile, subdir: str = "evidencias") -> str:
     disk_path = folder / name
     with open(disk_path, "wb") as out:
         out.write(f.file.read())
-    # ruta pública
-    rel = disk_path.relative_to(UPLOAD_ROOT).as_posix()
+    rel = disk_path.relative_to(UPLOAD_ROOT).as_posix()  # ruta pública
     return f"/uploads/{rel}"
 
 # -----------------------------------------------------------------------------
@@ -127,12 +126,33 @@ def _today_str_tzcl():
     # Fecha de Chile (para filtros diarios en reportes)
     return dt.datetime.now(dt.timezone(dt.timedelta(hours=-4))).date().isoformat()
 
+def _get_first(data: Dict, *keys, cast="float"):
+    for k in keys:
+        if k in data and data[k] not in (None, ""):
+            return _to_float_or_none(data[k]) if cast == "float" else data[k]
+    return None
+
+# -----------------------------------------------------------------------------
+# Routers externos (FREE Cloudinary sign)
+# -----------------------------------------------------------------------------
+try:
+    from routers.cloudinary import router as cloudinary_router
+    app.include_router(cloudinary_router)
+except Exception as _e:
+    # Si no existe el archivo, no rompemos el servidor
+    pass
+
 # -----------------------------------------------------------------------------
 # Salud
 # -----------------------------------------------------------------------------
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+# Alias para monitores externos (UptimeRobot/Expo background)
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
 
 # -----------------------------------------------------------------------------
 # RUTA ACTIVA — listar / editar
@@ -409,18 +429,24 @@ def obtener_entregas_app():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# JSON (compat): mantiene el endpoint antiguo, ahora con motivo/usuario/foto_url opcional
+# JSON (compat): ahora acepta lat/lon con varios alias (gps_lat/gps_lng incluidos)
 @app.post("/entregas-app")
 def registrar_entrega_json(data: Dict):
     try:
+        # Acepta múltiples claves desde la app móvil (free/offline-first)
+        lat = _get_first(data, "latitud", "gps_lat", "lat")
+        lon = _get_first(data, "longitud", "gps_lng", "lng", "lon")
+        fecha_sql = data.get("fecha") or None
+        estado = _to_int_or_none(data.get("estado"))
+
         with get_conn_cursor() as (_, cur):
             cur.execute("""
                 INSERT INTO entregas_app (nombre, camion, litros, estado, fecha, latitud, longitud, foto_url, motivo, usuario)
                 VALUES (%s, %s, %s, %s, COALESCE(%s, NOW()::timestamp), %s, %s, %s, %s, %s)
             """, (
                 data.get("nombre"), data.get("camion"), data.get("litros"),
-                data.get("estado"), data.get("fecha"),
-                data.get("latitud"), data.get("longitud"),
+                estado, fecha_sql,
+                lat, lon,
                 data.get("foto_url") or data.get("foto") or data.get("foto_uri"),
                 data.get("motivo"), data.get("usuario"),
             ))
@@ -428,7 +454,7 @@ def registrar_entrega_json(data: Dict):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# MULTIPART (con foto real)
+# MULTIPART (con foto real → guarda local si no usas Cloudinary)
 @app.post("/entregas-app-form")
 async def registrar_entrega_form(
     nombre: str = Form(...),
@@ -574,7 +600,6 @@ def estados_del_dia(
                 WHERE e.estado IS NOT NULL
             """, params_r + [fecha_d])
             filas = cur.fetchall()
-            # Retornamos array de objetos simple
             return [{"id": rid, "estado": est} for (rid, est) in filas]
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -598,7 +623,7 @@ def drop_redistribucion():
             cur.execute("DROP TABLE IF EXISTS redistribucion;")
         return {"mensaje": "✅ Tabla redistribucion eliminada (si existía)"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail:str(e))
 
 @app.post("/admin/migrar-entregas-app")
 def migrar_entregas_app():
