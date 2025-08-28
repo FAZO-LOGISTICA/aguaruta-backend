@@ -351,7 +351,7 @@ def importar_ruta_activa_file(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail:str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 # -----------------------------------------------------------------------------
 # EXPORTAR RUTA ACTIVA a Excel
@@ -406,7 +406,7 @@ def registrar_nuevo_punto(data: Dict):
             pass
         return {"mensaje": "✅ Nuevo punto registrado en ruta activa", "id": new_id}
     except Exception as e:
-        raise HTTPException(status_code=500, detail:str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/registrar-nuevo-punto-auto")
 def registrar_nuevo_punto_auto(data: Dict):
@@ -477,7 +477,7 @@ def registrar_nuevo_punto_auto(data: Dict):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail:str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 # -----------------------------------------------------------------------------
 # ENTREGAS APP (historial y registro)
@@ -494,7 +494,7 @@ def obtener_entregas_app():
             filas = cur.fetchall()
             return _rows_to_dicts(cur, filas)
     except Exception as e:
-        raise HTTPException(status_code=500, detail:str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 # JSON (compat): acepta alias gps_lat/gps_lng
 @app.post("/entregas-app")
@@ -518,7 +518,7 @@ def registrar_entrega_json(data: Dict):
             ))
         return {"mensaje": "✅ Entrega registrada correctamente"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail:str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 # MULTIPART (con foto real → guarda local si no usas Cloudinary)
 @app.post("/entregas-app-form")
@@ -549,7 +549,7 @@ async def registrar_entrega_form(
             ))
         return {"mensaje": "✅ Entrega registrada correctamente", "foto_url": foto_url}
     except Exception as e:
-        raise HTTPException(status_code=500, detail:str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 # -----------------------------------------------------------------------------
 # SHIMs de listados
@@ -589,7 +589,7 @@ def listar_entregas(
             rows = cur.fetchall()
             return _rows_to_dicts(cur, rows)
     except Exception as e:
-        raise HTTPException(status_code=500, detail:str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/entregas/no-entregadas")
 def listar_no_entregadas(
@@ -619,7 +619,7 @@ def listar_no_entregadas(
             rows = cur.fetchall()
             return _rows_to_dicts(cur, rows)
     except Exception as e:
-        raise HTTPException(status_code=500, detail:str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 # -----------------------------------------------------------------------------
 # NUEVO: ESTADOS DEL DÍA (para pintar verde/rojo en la app)
@@ -667,7 +667,7 @@ def estados_del_dia(
             filas = cur.fetchall()
             return [{"id": rid, "estado": est} for (rid, est) in filas]
     except Exception as e:
-        raise HTTPException(status_code=500, detail:str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 # -----------------------------------------------------------------------------
 # Limpieza / utilidades / migraciones simples
@@ -684,7 +684,7 @@ def limpiar_tablas():
             pass
         return {"mensaje": "✅ Tabla ruta_activa limpiada"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail:str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/admin/drop-redistribucion")
 def drop_redistribucion():
@@ -693,7 +693,7 @@ def drop_redistribucion():
             cur.execute("DROP TABLE IF EXISTS redistribucion;")
         return {"mensaje": "✅ Tabla redistribucion eliminada (si existía)"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail:str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/admin/migrar-entregas-app")
 def migrar_entregas_app():
@@ -728,7 +728,7 @@ def migrar_entregas_app():
             """)
         return {"ok": True, "mensaje": "✅ Migración aplicada (entregas_app)"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail:str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 # -----------------------------------------------------------------------------
 # ✅ Nuevo endpoint público para sincronizar Excel del mapa
@@ -738,4 +738,4 @@ def sync_mapa():
     try:
         return _sync_mapa_internal()
     except Exception as e:
-        raise HTTPException(status_code=500, detail:str(e))
+        raise HTTPException(status_code=500, detail=str(e))
