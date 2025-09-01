@@ -1,853 +1,309 @@
-# backend/main.py
+# principal.py
+# Backend FastAPI – AguaRuta (versión consolidada)
+# - Pool PostgreSQL con SSL
+# - CORS para web/app
+# - /url.txt servido desde archivo local
+# - Evidencias en /fotos/evidencias/YYYY/MM
+# - Rutas mínimas de respaldo si no existen routers externos
+
+import os
+import io
+import sys
+import json
+import uuid
+import math
+import time
+import shutil
+import logging
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from typing import Dict, Optional, List
-from contextlib import contextmanager
+
+import psycopg2
 from psycopg2.pool import SimpleConnectionPool
-from psycopg2.extras import execute_values
-import pandas as pd
-import io
-import os
-import math
-import datetime as dt
-import uuid
-import time
-import threading
-import asyncio
-from pathlib import Path
 
 # =============================================================================
-# Configuración inicial
+# CONFIGURACIÓN GENERAL
 # =============================================================================
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise ValueError("❌ DATABASE_URL no está configurada en variables de entorno")
 
-def _augment_dsn(url: str) -> str:
-    out = url
-    if "sslmode=" not in out:
-        out += ("&sslmode=require" if "?" in out else "?sslmode=require")
-    if "connect_timeout=" not in out:
-        out += ("&connect_timeout=5" if "?" in out else "?connect_timeout=5")
-    if "application_name=" not in out:
-        out += ("&application_name=aguaruta-api" if "?" in out else "?application_name=aguaruta-api")
-    return out
+APP_NAME = "AguaRuta Backend"
+BASE_DIR = Path(__file__).resolve().parent
+FOTOS_DIR = BASE_DIR / "fotos" / "evidencias"
 
-DATABASE_URL = _augment_dsn(DATABASE_URL)
+# Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+log = logging.getLogger("aguaruta")
 
-# Reintentos/timeouts por request vs startup
-REQUEST_POOL_MAX_ATTEMPTS = int(os.getenv("DB_REQUEST_ATTEMPTS", "2"))         # fail-fast
-REQUEST_CONNECT_TIMEOUT   = int(os.getenv("DB_REQUEST_CONNECT_TIMEOUT", "3"))  # seg por intento
-STARTUP_POOL_MAX_ATTEMPTS = int(os.getenv("DB_STARTUP_ATTEMPTS", "3"))         # al iniciar
-STARTUP_CONNECT_TIMEOUT   = int(os.getenv("DB_STARTUP_CONNECT_TIMEOUT", "5"))  # seg por intento
-POOL_MAX_CONN             = int(os.getenv("DB_POOL_MAX_CONN", "10"))           # hobby ~10
-KEEPALIVE_SECONDS         = int(os.getenv("DB_KEEPALIVE_SECONDS", "120"))      # ping periódico
+# -----------------------------------------------------------------------------
+# DB: URL + Pool con SSL
+# -----------------------------------------------------------------------------
+DB_URL = (
+    os.getenv("DATABASE_URL")
+    or os.getenv("DB_URL")
+    or os.getenv("POSTGRES_URL")
+)
 
-app = FastAPI(title="AguaRuta API", version="3.3.0")
+if not DB_URL:
+    log.warning("⚠️ Falta DATABASE_URL/DB_URL en variables de entorno. "
+                "Se cargarán rutas de respaldo si aplican.")
+else:
+    # Forzar sslmode=require si no está presente (evita errores en Render/Neon)
+    if "sslmode=" not in DB_URL:
+        sep = "&" if ("?" in DB_URL) else "?"
+        DB_URL = f"{DB_URL}{sep}sslmode=require"
 
-# CORS (Netlify + local + móviles en pruebas)
+pool: Optional[SimpleConnectionPool] = None
+
+def init_pool():
+    global pool
+    if DB_URL and (pool is None):
+        log.info("Inicializando pool de conexiones…")
+        pool = SimpleConnectionPool(
+            minconn=1,
+            maxconn=int(os.getenv("DB_MAX_CONN", "8")),
+            dsn=DB_URL
+        )
+        log.info("Pool de conexiones listo.")
+
+def get_conn():
+    if pool is None:
+        init_pool()
+    if pool is None:
+        raise RuntimeError("No hay pool de conexiones DB.")
+    return pool.getconn()
+
+def put_conn(conn):
+    if pool and conn:
+        pool.putconn(conn)
+
+# =============================================================================
+# FASTAPI APP
+# =============================================================================
+
+app = FastAPI(title=APP_NAME)
+
+# CORS (Netlify, Expo y genérico)
+allow_origins = [
+    os.getenv("FRONTEND_ORIGIN", "https://aguaruta.netlify.app"),
+    "http://localhost",
+    "http://localhost:3000",
+    "http://localhost:5173",
+    # Expo Go / Metro typical origins (no siempre aplican a CORS, pero no estorban)
+    "exp://localhost",
+    "http://192.168.0.0/16",
+    "*",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://aguaruta.netlify.app",
-        "http://localhost:3000",
-        "http://localhost:5173",
-        "*",
-    ],
+    allow_origins=allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Estáticos para evidencias
+FOTOS_DIR.mkdir(parents=True, exist_ok=True)
+if not any(m.path == "/fotos" for m in app.router.routes if hasattr(m, "path")):
+    app.mount("/fotos", StaticFiles(directory=str(BASE_DIR / "fotos")), name="fotos")
+
 # =============================================================================
-# Pool de conexiones (lazy) + retries + warmup en background
+# SALUD
 # =============================================================================
-_pool: Optional[SimpleConnectionPool] = None
-_bg_booting = False
-_bg_lock = threading.Lock()
 
-def _init_pool_with_retries(max_attempts: int = 6, connect_timeout: Optional[int] = None) -> None:
-    """Inicializa el pool con reintentos exponenciales."""
-    global _pool
-    if _pool is not None:
-        return
-    last_err = None
-    for attempt in range(max_attempts):
-        try:
-            _pool = SimpleConnectionPool(
-                1, POOL_MAX_CONN,
-                dsn=DATABASE_URL,
-                keepalives=1,
-                keepalives_idle=30,
-                keepalives_interval=10,
-                keepalives_count=5,
-                **({"connect_timeout": connect_timeout} if connect_timeout else {})
-            )
-            # Smoke test
-            conn = _pool.getconn()
-            try:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT 1;")
-                    cur.fetchone()
-            finally:
-                _pool.putconn(conn)
-            return
-        except Exception as e:
-            last_err = e
-            time.sleep(min(10, 2 ** attempt))  # 1,2,4,8,10...
-    raise last_err
+@app.get("/", response_class=PlainTextResponse)
+def root():
+    return f"{APP_NAME} OK"
 
-def _bg_warmup():
-    """Sigue intentando en segundo plano levantar el pool."""
-    global _bg_booting
+# =============================================================================
+# /url.txt  (descubrimiento de URL del backend para la app móvil)
+# =============================================================================
+
+@app.get("/url.txt", response_class=PlainTextResponse)
+def url_txt():
+    """
+    Devuelve el contenido del archivo url.txt (una sola línea con la URL pública actual).
+    """
+    fp = BASE_DIR / "url.txt"
+    if not fp.exists():
+        raise HTTPException(status_code=404, detail="url.txt no existe")
+    return fp.read_text(encoding="utf-8").strip()
+
+# =============================================================================
+# Carga opcional de routers externos si existen
+# =============================================================================
+
+def try_include_router(mod_path: str, attr: str = "router", prefix: str = ""):
     try:
-        _init_pool_with_retries(max_attempts=12, connect_timeout=10)
-    finally:
-        with _bg_lock:
-            _bg_booting = False
-
-def _kick_bg_warmup():
-    """Dispara el warmup si no hay uno activo."""
-    global _bg_booting
-    with _bg_lock:
-        if not _bg_booting and _pool is None:
-            _bg_booting = True
-            threading.Thread(target=_bg_warmup, daemon=True).start()
-
-@app.on_event("startup")
-def _startup_try_pool():
-    try:
-        _init_pool_with_retries(
-            max_attempts=STARTUP_POOL_MAX_ATTEMPTS,
-            connect_timeout=STARTUP_CONNECT_TIMEOUT
-        )
+        module = __import__(mod_path, fromlist=[attr])
+        router = getattr(module, attr)
+        app.include_router(router, prefix=prefix)
+        log.info(f"Router '{mod_path}' cargado")
+        return True
     except Exception as e:
-        print(f"[WARN] No se pudo inicializar el pool al inicio: {e}")
-        _kick_bg_warmup()
-
-@app.on_event("startup")
-async def _db_keepalive_task():
-    async def tick():
-        while True:
-            try:
-                if _pool is not None:
-                    conn = _pool.getconn()
-                    try:
-                        with conn.cursor() as cur:
-                            cur.execute("SELECT 1;")
-                    finally:
-                        _pool.putconn(conn)
-                else:
-                    _kick_bg_warmup()
-            except Exception:
-                _kick_bg_warmup()
-            await asyncio.sleep(KEEPALIVE_SECONDS)
-    asyncio.create_task(tick())
-
-# =============================================================================
-# Archivos estáticos (fotos locales)
-# =============================================================================
-UPLOAD_ROOT = Path(os.getenv("UPLOAD_ROOT", "uploads")).resolve()
-UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
-app.mount("/uploads", StaticFiles(directory=str(UPLOAD_ROOT)), name="uploads")
-
-def _safe_ext(filename: str) -> str:
-    ext = (filename or "").split(".")[-1].lower()
-    return ext if ext in {"jpg", "jpeg", "png", "webp"} else "jpg"
-
-def _save_upload_file(f: UploadFile, subdir: str = "evidencias") -> str:
-    today = dt.datetime.now()
-    folder = UPLOAD_ROOT / subdir / f"{today:%Y}" / f"{today:%m}"
-    folder.mkdir(parents=True, exist_ok=True)
-    ext = _safe_ext(f.filename)
-    name = f"{today:%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}.{ext}"
-    disk_path = folder / name
-    with open(disk_path, "wb") as out:
-        out.write(f.file.read())
-    rel = disk_path.relative_to(UPLOAD_ROOT).as_posix()
-    return f"/uploads/{rel}"
-
-# =============================================================================
-# Helpers DB
-# =============================================================================
-def _get_pool_or_503() -> SimpleConnectionPool:
-    global _pool
-    if _pool is None:
-        try:
-            _init_pool_with_retries(
-                max_attempts=REQUEST_POOL_MAX_ATTEMPTS,
-                connect_timeout=REQUEST_CONNECT_TIMEOUT
-            )
-        except Exception as e:
-            _kick_bg_warmup()
-            raise HTTPException(status_code=503, detail=f"Base de datos no disponible: {e}")
-    return _pool
-
-@contextmanager
-def get_conn_cursor():
-    pool = _get_pool_or_503()
-    conn = pool.getconn()
-    cur = conn.cursor()
-    try:
-        yield conn, cur
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        raise e
-    finally:
-        try:
-            cur.close()
-        except Exception:
-            pass
-        pool.putconn(conn)
-
-def _rows_to_dicts(cur, rows):
-    cols = [d[0] for d in cur.description]
-    return [dict(zip(cols, r)) for r in rows]
-
-# =============================================================================
-# Helpers numéricos y geo
-# =============================================================================
-def _to_float_or_none(x):
-    if x is None or x == "":
-        return None
-    try:
-        return float(str(x).strip().replace(",", "."))
-    except Exception:
-        return None
-
-def _to_int_or_none(x):
-    v = _to_float_or_none(x)
-    if v is None:
-        return None
-    try:
-        return int(v)
-    except Exception:
-        return None
-
-def _valid_lat_lon(lat, lon) -> bool:
-    try:
-        return (-90.0 <= float(lat) <= 90.0) and (-180.0 <= float(lon) <= 180.0)
-    except Exception:
+        log.warning(f"No se pudo cargar router {mod_path}: {e}")
         return False
 
-def _haversine_km(lat1, lon1, lat2, lon2) -> float:
-    R = 6371.0
-    p1 = math.radians(lat1)
-    p2 = math.radians(lat2)
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
-    a = math.sin(dlat/2)**2 + math.cos(p1) * math.cos(p2) * math.sin(dlon/2)**2
-    c = 2 * math.asin(math.sqrt(a))
-    return R * c
-
-def _today_str_tzcl():
-    # Usamos -4 fijo para simplicidad (Chile continental)
-    return dt.datetime.now(dt.timezone(dt.timedelta(hours=-4))).date().isoformat()
-
-def _get_first(data: Dict, *keys, cast="float"):
-    for k in keys:
-        if k in data and data[k] not in (None, ""):
-            return _to_float_or_none(data[k]) if cast == "float" else data[k]
-    return None
+loaded_rutas = try_include_router("enrutadores.rutas_activas")  # expone /rutas-activas
+loaded_entregas = try_include_router("enrutadores.entregas")    # expone /entregas-app
+_ = try_include_router("enrutadores.redistribucion")            # opcional
 
 # =============================================================================
-# Datos mapa (Excel)
+# FALLBACKS (si no existen routers)
 # =============================================================================
-DATA_DIR = Path("data"); DATA_DIR.mkdir(parents=True, exist_ok=True)
-MAP_XLSX = DATA_DIR / "base_datos_todos_con_coordenadas.xlsx"
 
-def _sync_mapa_internal() -> Dict:
-    with get_conn_cursor() as (_, cur):
-        cur.execute("""
-            SELECT nombre, litros, telefono, latitud, longitud
-            FROM ruta_activa
-            WHERE latitud IS NOT NULL AND longitud IS NOT NULL
-        """)
-        rows = cur.fetchall()
-        cols = [d[0] for d in cur.description]
+def ensure_table_entregas_app(conn):
+    sql = """
+    CREATE TABLE IF NOT EXISTS entregas_app (
+        id UUID PRIMARY KEY,
+        nombre TEXT,
+        camion TEXT,
+        litros INTEGER,
+        estado INTEGER,
+        fecha TIMESTAMP,
+        lat DOUBLE PRECISION,
+        lon DOUBLE PRECISION,
+        foto_ruta TEXT
+    );
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql)
+        conn.commit()
 
-    df = pd.DataFrame(rows, columns=cols)
-    if df.empty:
-        return {"ok": False, "puntos_exportados": 0, "archivo": str(MAP_XLSX)}
-
-    for c in ["latitud", "longitud", "litros"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df[df["latitud"].between(-90, 90) & df["longitud"].between(-180, 180)]
-
-    with pd.ExcelWriter(MAP_XLSX, engine="openpyxl") as w:
-        df.to_excel(w, index=False, sheet_name="puntos")
-
-    return {"ok": True, "puntos_exportados": int(len(df)), "archivo": str(MAP_XLSX)}
-
-# =============================================================================
-# Routers externos (Cloudinary opcional)
-# =============================================================================
-try:
-    from routers.cloudinary import router as cloudinary_router
-    app.include_router(cloudinary_router)
-except Exception:
-    pass
-
-# =============================================================================
-# Salud / Diagnóstico
-# =============================================================================
-@app.get("/")
-def root():
-    return {"name": "AguaRuta API", "version": app.version}
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-@app.get("/healthz")
-def healthz():
-    return {"ok": True}
-
-@app.get("/status")
-def status():
-    return {"api": True, "pool_ready": _pool is not None}
-
-@app.get("/db/ping")
-def db_ping():
-    try:
-        with get_conn_cursor() as (_, cur):
-            cur.execute("SELECT 1;")
-            cur.fetchone()
-        return {"ok": True}
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        _kick_bg_warmup()
-        return {"ok": False, "error": str(e)}
-
-# =============================================================================
-# RUTA ACTIVA — listar / editar
-# =============================================================================
-@app.get("/rutas-activas")
-def obtener_rutas_activas(camion: Optional[str] = None, dia: Optional[str] = None):
-    try:
-        where = []
-        params: List[str] = []
-        if camion:
-            where.append("UPPER(camion) = UPPER(%s)")
-            params.append(camion)
-        if dia:
-            where.append("UPPER(dia) = UPPER(%s)")
-            params.append(dia)
-
-        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
-        with get_conn_cursor() as (_, cur):
-            cur.execute(f"""
-                SELECT id, camion, nombre, dia, litros, telefono, latitud, longitud
-                FROM ruta_activa
-                {where_sql}
-                ORDER BY camion, dia, nombre
-            """, params)
-            filas = cur.fetchall()
-            return _rows_to_dicts(cur, filas)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.put("/rutas-activas/{id}")
-def editar_ruta_activa(id: int, data: Dict):
-    try:
-        if not data:
-            raise HTTPException(status_code=400, detail="Body vacío")
-        with get_conn_cursor() as (_, cur):
-            sets = ", ".join([f"{k} = %s" for k in data.keys()])
-            values = list(data.values()) + [id]
-            cur.execute(f"UPDATE ruta_activa SET {sets} WHERE id = %s", values)
-            if cur.rowcount == 0:
-                raise HTTPException(status_code=404, detail="Registro no encontrado")
+if not loaded_rutas:
+    @app.get("/rutas-activas")
+    def rutas_activas():
+        """
+        Respaldo mínimo de /rutas-activas si no hay router:
+        SELECT camion, nombre, latitud, longitud, litros, dia_asignado AS dia, telefono FROM ruta_activa
+        """
+        if pool is None:
+            raise HTTPException(status_code=503, detail="DB no configurada")
+        conn = get_conn()
         try:
-            _sync_mapa_internal()
-        except Exception:
-            pass
-        return {"mensaje": "✅ Registro actualizado correctamente", "id": id}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                        camion,
+                        nombre,
+                        latitud,
+                        longitud,
+                        litros,
+                        COALESCE(dia_asignado, dia) AS dia,
+                        telefono
+                    FROM ruta_activa
+                """)
+                rows = cur.fetchall()
+                cols = [d[0] for d in cur.description]
+            data = [dict(zip(cols, r)) for r in rows]
+            return data
+        finally:
+            put_conn(conn)
 
-# Compat
-@app.put("/editar-ruta")
-def editar_ruta_legacy(payload: Dict):
-    try:
-        rid = payload.get("id") or payload.get("ID") or payload.get("Id")
-        if not rid:
-            raise HTTPException(status_code=400, detail="Falta 'id' en el payload")
-        allowed = {"camion", "nombre", "dia", "litros", "telefono", "latitud", "longitud"}
-        data = {k.lower(): v for k, v in (payload or {}).items() if k.lower() in allowed}
-        if "litros"   in data: data["litros"]   = _to_int_or_none(data["litros"])
-        if "latitud"  in data: data["latitud"]  = _to_float_or_none(data["latitud"])
-        if "longitud" in data: data["longitud"] = _to_float_or_none(data["longitud"])
-        if not data:
-            raise HTTPException(status_code=400, detail="Sin campos para actualizar")
-        with get_conn_cursor() as (_, cur):
-            sets = ", ".join([f"{k} = %s" for k in data.keys()])
-            values = list(data.values()) + [rid]
-            cur.execute(f"UPDATE ruta_activa SET {sets} WHERE id = %s", values)
-            if cur.rowcount == 0:
-                raise HTTPException(status_code=404, detail="Registro no encontrado")
+if not loaded_entregas:
+    @app.post("/entregas-app")
+    async def entregas_app(
+        nombre: str = Form(...),
+        camion: str = Form(...),
+        litros: str = Form(...),
+        estado: int = Form(...),        # 1=entregada(sin foto), 0/2=con foto, 3=sin foto
+        fecha: str = Form(...),         # "YYYY-MM-DD" o ISO
+        lat: Optional[float] = Form(None),
+        lon: Optional[float] = Form(None),
+        foto: Optional[UploadFile] = File(None),
+    ):
+        """
+        Guarda entrega + evidencia (si corresponde) y registra en Postgres.
+        Devuelve {ok, id, foto_url?}
+        """
+        if pool is None:
+            raise HTTPException(status_code=503, detail="DB no configurada")
+
+        # Normaliza litros/fecha
         try:
-            _sync_mapa_internal()
+            litros_int = int(float(litros))
         except Exception:
-            pass
-        return {"ok": True, "id": rid, "mensaje": "✅ Registro actualizado"}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.put("/editar-ruta/{id}")
-def editar_ruta_legacy_with_id(id: int, payload: Dict):
-    payload = dict(payload or {})
-    payload["id"] = id
-    return editar_ruta_legacy(payload)
-
-# =============================================================================
-# IMPORTAR RUTA ACTIVA (CSV/XLSX)
-# =============================================================================
-@app.post("/admin/importar-ruta-activa-file")
-def importar_ruta_activa_file(
-    archivo: UploadFile = File(...),
-    truncate: bool = Form(True),
-):
-    try:
-        content = archivo.file.read()
-        nombre = (archivo.filename or "").lower()
-        if nombre.endswith(".xlsx"):
-            df = pd.read_excel(io.BytesIO(content), dtype=str)
-        elif nombre.endswith(".csv"):
-            try:
-                df = pd.read_csv(io.BytesIO(content), dtype=str, encoding="utf-8")
-            except Exception:
-                df = pd.read_csv(io.BytesIO(content), dtype=str, encoding="latin-1")
-        else:
-            raise HTTPException(status_code=400, detail="Formato no soportado. Sube .csv o .xlsx")
-
-        df.columns = [c.strip().lower() for c in df.columns]
-
-        def pick(df, col, *alts):
-            for c in (col, *alts):
-                if c in df.columns:
-                    return df[c]
-            return None
-
-        out = pd.DataFrame({
-            "camion":   pick(df, "camion"),
-            "nombre":   pick(df, "nombre", "jefe_hogar"),
-            "dia":      pick(df, "dia", "dia_asignado"),
-            "litros":   pick(df, "litros", "litros_de_entrega"),
-            "telefono": pick(df, "telefono", "phone"),
-            "latitud":  pick(df, "latitud", "lat", "latitude"),
-            "longitud": pick(df, "longitud", "lon", "lng", "longitude"),
-        })
-
-        for c in ["latitud", "longitud", "litros"]:
-            out[c] = pd.to_numeric(out[c].astype(str).str.replace(",", ".", regex=False), errors="coerce")
-        for c in ["camion", "nombre", "dia", "telefono"]:
-            out[c] = out[c].astype(str).str.strip().replace({"nan": None, "None": None, "": None})
-        out = out.where(pd.notnull(out), None)
-
-        rows = list(out.itertuples(index=False, name=None))
-        if not rows:
-            raise HTTPException(status_code=400, detail="Archivo sin filas útiles")
-
-        with get_conn_cursor() as (_, cur):
-            if truncate:
-                cur.execute("TRUNCATE TABLE ruta_activa;")
-            execute_values(cur, """
-                INSERT INTO ruta_activa (camion, nombre, dia, litros, telefono, latitud, longitud)
-                VALUES %s
-            """, rows)
+            litros_int = None
 
         try:
-            _sync_mapa_internal()
-        except Exception:
-            pass
-
-        return {"ok": True, "insertados": len(rows)}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# =============================================================================
-# EXPORTAR RUTA ACTIVA a Excel
-# =============================================================================
-@app.get("/exportar-excel")
-def exportar_excel():
-    try:
-        with get_conn_cursor() as (_, cur):
-            cur.execute("""
-                SELECT camion, nombre, dia, litros, telefono, latitud, longitud
-                FROM ruta_activa
-                ORDER BY camion, dia, nombre
-            """)
-            filas = cur.fetchall()
-            cols = [d[0] for d in cur.description]
-
-        df = pd.DataFrame(filas, columns=cols)
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="Rutas Activas")
-        output.seek(0)
-
-        return StreamingResponse(
-            output,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": "attachment; filename=rutas_activas.xlsx"}
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# =============================================================================
-# REGISTRAR NUEVO PUNTO (manual / auto)
-# =============================================================================
-@app.post("/registrar-nuevo-punto")
-def registrar_nuevo_punto(data: Dict):
-    try:
-        with get_conn_cursor() as (_, cur):
-            cur.execute("""
-                INSERT INTO ruta_activa (camion, nombre, dia, litros, telefono, latitud, longitud)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                RETURNING id
-            """, (
-                data.get("camion"), data.get("nombre"), data.get("dia"),
-                data.get("litros"), data.get("telefono"),
-                data.get("latitud"), data.get("longitud")
-            ))
-            new_id = cur.fetchone()[0]
-        try:
-            _sync_mapa_internal()
-        except Exception:
-            pass
-        return {"mensaje": "✅ Nuevo punto registrado en ruta activa", "id": new_id}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/registrar-nuevo-punto-auto")
-def registrar_nuevo_punto_auto(data: Dict):
-    try:
-        nombre = (data.get("nombre") or "").strip()
-        litros = _to_int_or_none(data.get("litros"))
-        telefono = (data.get("telefono") or None)
-        lat = _to_float_or_none(data.get("latitud"))
-        lon = _to_float_or_none(data.get("longitud"))
-        dia_in = (data.get("dia") or None)
-
-        if not nombre:
-            raise HTTPException(status_code=400, detail="Falta 'nombre'")
-        if litros is None or litros <= 0:
-            raise HTTPException(status_code=400, detail="'litros' inválido")
-        if lat is None or lon is None or not _valid_lat_lon(lat, lon):
-            raise HTTPException(status_code=400, detail="Coordenadas inválidas")
-
-        with get_conn_cursor() as (_, cur):
-            cur.execute("""
-                SELECT id, camion, dia, latitud, longitud
-                FROM ruta_activa
-                WHERE camion IS NOT NULL
-                  AND latitud IS NOT NULL
-                  AND longitud IS NOT NULL
-            """)
-            filas = cur.fetchall() or []
-
-            mejor = None
-            for (rid, camion_ref, dia_ref, lat_ref, lon_ref) in filas:
-                try:
-                    dkm = _haversine_km(lat, lon, float(lat_ref), float(lon_ref))
-                except Exception:
-                    continue
-                if (mejor is None) or (dkm < mejor[0]):
-                    mejor = (dkm, str(camion_ref).upper() if camion_ref else None, dia_ref, rid)
-
-            if mejor:
-                dist_km, camion_sel, dia_sel, ref_id = mejor
-                camion_final = camion_sel or "A1"
-                dia_final = dia_in or dia_sel
-                ref = {"id_ref": ref_id, "dist_km": round(dist_km, 3)}
+            # Acepta fecha "YYYY-MM-DD" o ISO
+            if len(fecha) <= 10:
+                dt = datetime.strptime(fecha, "%Y-%m-%d")
             else:
-                camion_final = "A1"
-                dia_final = dia_in
-                ref = {"id_ref": None, "dist_km": None}
-
-            cur.execute("""
-                INSERT INTO ruta_activa (camion, nombre, dia, litros, telefono, latitud, longitud)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                RETURNING id
-            """, (camion_final, nombre, dia_final, litros, telefono, lat, lon))
-            new_id = cur.fetchone()[0]
-
-        try:
-            _sync_mapa_internal()
+                dt = datetime.fromisoformat(fecha.replace("Z", "+00:00"))
         except Exception:
-            pass
+            dt = datetime.utcnow()
 
-        return {
-            "ok": True,
-            "mensaje": "✅ Punto registrado y asignado por proximidad",
-            "id": new_id,
-            "asignacion": {"camion": camion_final, "dia": dia_final},
-            "referencia": ref,
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# =============================================================================
-# ENTREGAS APP (historial y registro)
-# =============================================================================
-@app.get("/entregas-app")
-def obtener_entregas_app():
-    try:
-        with get_conn_cursor() as (_, cur):
-            cur.execute("""
-                SELECT nombre, camion, litros, estado, fecha, latitud, longitud, foto_url, motivo, usuario
-                FROM entregas_app
-                ORDER BY fecha DESC
-            """)
-            filas = cur.fetchall()
-            return _rows_to_dicts(cur, filas)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/entregas-app")
-def registrar_entrega_json(data: Dict):
-    try:
-        lat = _get_first(data, "latitud", "gps_lat", "lat")
-        lon = _get_first(data, "longitud", "gps_lng", "lng", "lon")
-        fecha_sql = data.get("fecha") or None
-        estado = _to_int_or_none(data.get("estado"))
-
-        with get_conn_cursor() as (_, cur):
-            cur.execute("""
-                INSERT INTO entregas_app (nombre, camion, litros, estado, fecha, latitud, longitud, foto_url, motivo, usuario)
-                VALUES (%s, %s, %s, %s, COALESCE(%s, NOW()::timestamp), %s, %s, %s, %s, %s)
-            """, (
-                data.get("nombre"), data.get("camion"), data.get("litros"),
-                estado, fecha_sql,
-                lat, lon,
-                data.get("foto_url") or data.get("foto") or data.get("foto_uri"),
-                data.get("motivo"), data.get("usuario"),
-            ))
-        return {"mensaje": "✅ Entrega registrada correctamente"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/entregas-app-form")
-async def registrar_entrega_form(
-    nombre: str = Form(...),
-    camion: str = Form(...),
-    litros: Optional[int] = Form(None),
-    estado: int = Form(...),
-    fecha: Optional[str] = Form(None),
-    latitud: Optional[float] = Form(None),
-    longitud: Optional[float] = Form(None),
-    motivo: Optional[str] = Form(None),
-    usuario: Optional[str] = Form(None),
-    foto: UploadFile = File(None),
-):
-    try:
-        foto_url = None
+        # Guardar foto si viene adjunta
+        foto_rel = None
         if foto is not None:
-            foto_url = _save_upload_file(foto, subdir="evidencias")
+            if not str(foto.content_type).lower().startswith("image/"):
+                raise HTTPException(status_code=400, detail="Archivo de foto inválido")
 
-        fecha_sql = fecha or None
-        with get_conn_cursor() as (_, cur):
-            cur.execute("""
-                INSERT INTO entregas_app (nombre, camion, litros, estado, fecha, latitud, longitud, foto_url, motivo, usuario)
-                VALUES (%s, %s, %s, %s, COALESCE(%s, NOW()::timestamp), %s, %s, %s, %s, %s)
-            """, (
-                nombre, camion, litros, estado, fecha_sql, latitud, longitud, foto_url, motivo, usuario
-            ))
-        return {"mensaje": "✅ Entrega registrada correctamente", "foto_url": foto_url}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+            y = dt.year
+            m = f"{dt.month:02d}"
+            destino = FOTOS_DIR / str(y) / m
+            destino.mkdir(parents=True, exist_ok=True)
+            fname = f"evidencia_{uuid.uuid4().hex}.jpg"
+            fpath = destino / fname
 
-# =============================================================================
-# SHIMs de listados
-# =============================================================================
-@app.get("/entregas")
-def listar_entregas(
-    desde: Optional[str] = None,
-    hasta: Optional[str] = None,
-    estado: Optional[str] = None,
-    camion: Optional[str] = None,
-    nombre: Optional[str] = None,
-):
-    try:
-        where = []
-        params: List[str] = []
+            # Save to disk
+            with open(fpath, "wb") as out:
+                shutil.copyfileobj(foto.file, out)
 
-        if desde:
-            where.append("fecha::date >= %s"); params.append(desde)
-        if hasta:
-            where.append("fecha::date <= %s"); params.append(hasta)
-        if estado:
-            where.append("UPPER(estado::text) = UPPER(%s)"); params.append(estado)
-        if camion:
-            where.append("UPPER(camion) = UPPER(%s)"); params.append(camion)
-        if nombre:
-            where.append("UPPER(nombre) LIKE UPPER(%s)"); params.append(f"%{nombre}%")
+            # URL pública (servimos /fotos/…)
+            foto_rel = f"/fotos/evidencias/{y}/{m}/{fname}"
 
-        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
-        sql = f"""
-            SELECT nombre, camion, litros, estado, fecha, latitud, longitud, foto_url, motivo, usuario
-            FROM entregas_app
-            {where_sql}
-            ORDER BY fecha DESC
-        """
-        with get_conn_cursor() as (_, cur):
-            cur.execute(sql, params)
-            rows = cur.fetchall()
-            return _rows_to_dicts(cur, rows)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/entregas/no-entregadas")
-def listar_no_entregadas(
-    desde: Optional[str] = None,
-    hasta: Optional[str] = None,
-    camion: Optional[str] = None,
-):
-    try:
-        where = ["estado IN (0,2,3)"]
-        params: List[str] = []
-        if desde:
-            where.append("fecha::date >= %s"); params.append(desde)
-        if hasta:
-            where.append("fecha::date <= %s"); params.append(hasta)
-        if camion:
-            where.append("UPPER(camion) = UPPER(%s)"); params.append(camion)
-
-        where_sql = "WHERE " + " AND ".join(where)
-        sql = f"""
-            SELECT nombre, camion, litros, estado, fecha, latitud, longitud, foto_url, motivo, usuario
-            FROM entregas_app
-            {where_sql}
-            ORDER BY fecha DESC
-        """
-        with get_conn_cursor() as (_, cur):
-            cur.execute(sql, params)
-            rows = cur.fetchall()
-            return _rows_to_dicts(cur, rows)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# =============================================================================
-# ESTADOS DEL DÍA
-# =============================================================================
-@app.get("/estados-dia")
-def estados_del_dia(
-    camion: str,
-    dia: Optional[str] = None,
-    fecha: Optional[str] = None,
-):
-    try:
-        fecha_d = fecha or _today_str_tzcl()
-        with get_conn_cursor() as (_, cur):
-            params_r = [camion]
-            where_r = ["UPPER(camion) = UPPER(%s)"]
-            if dia:
-                where_r.append("UPPER(dia) = UPPER(%s)")
-                params_r.append(dia)
-            where_r_sql = " AND ".join(where_r)
-
-            cur.execute(f"""
-                WITH base_ruta AS (
-                  SELECT id, camion, nombre
-                  FROM ruta_activa
-                  WHERE {where_r_sql}
-                ),
-                ult_entrega AS (
-                  SELECT DISTINCT ON (camion, nombre)
-                         camion, nombre, estado, fecha
-                  FROM entregas_app
-                  WHERE fecha::date = %s
-                  ORDER BY camion, nombre, fecha DESC
-                )
-                SELECT r.id, e.estado
-                FROM base_ruta r
-                JOIN ult_entrega e
-                  ON UPPER(e.camion)=UPPER(r.camion) AND UPPER(e.nombre)=UPPER(r.nombre)
-                WHERE e.estado IS NOT NULL
-            """, params_r + [fecha_d])
-            filas = cur.fetchall()
-            return [{"id": rid, "estado": est} for (rid, est) in filas]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# =============================================================================
-# Limpieza / utilidades / migraciones
-# =============================================================================
-@app.post("/limpiar-tablas")
-def limpiar_tablas():
-    try:
-        with get_conn_cursor() as (_, cur):
-            cur.execute("TRUNCATE TABLE ruta_activa;")
+        # Insert en DB
+        conn = get_conn()
         try:
-            _sync_mapa_internal()
-        except Exception:
-            pass
-        return {"mensaje": "✅ Tabla ruta_activa limpiada"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/admin/drop-redistribucion")
-def drop_redistribucion():
-    try:
-        with get_conn_cursor() as (_, cur):
-            cur.execute("DROP TABLE IF EXISTS redistribucion;")
-        return {"mensaje": "✅ Tabla redistribucion eliminada (si existía)"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/admin/migrar-entregas-app")
-def migrar_entregas_app():
-    """Agrega columnas faltantes a entregas_app (idempotente)."""
-    try:
-        with get_conn_cursor() as (_, cur):
-            cur.execute("""
-                DO $$
-                BEGIN
-                  IF NOT EXISTS (
-                    SELECT 1 FROM information_schema.columns
-                    WHERE table_name='entregas_app' AND column_name='foto_url'
-                  ) THEN
-                    ALTER TABLE entregas_app ADD COLUMN foto_url TEXT;
-                  END IF;
-                  IF NOT EXISTS (
-                    SELECT 1 FROM information_schema.columns
-                    WHERE table_name='entregas_app' AND column_name='motivo'
-                  ) THEN
-                    ALTER TABLE entregas_app ADD COLUMN motivo TEXT;
-                  END IF;
-                  IF NOT EXISTS (
-                    SELECT 1 FROM information_schema.columns
-                    WHERE table_name='entregas_app' AND column_name='usuario'
-                  ) THEN
-                    ALTER TABLE entregas_app ADD COLUMN usuario TEXT;
-                  END IF;
-                END$$;
-            """)
-        return {"ok": True, "mensaje": "✅ Migración aplicada (entregas_app)"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+            ensure_table_entregas_app(conn)
+            with conn.cursor() as cur:
+                rec_id = str(uuid.uuid4())
+                cur.execute(
+                    """
+                    INSERT INTO entregas_app
+                    (id, nombre, camion, litros, estado, fecha, lat, lon, foto_ruta)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    """,
+                    (rec_id, nombre, camion, litros_int, estado, dt, lat, lon, foto_rel),
+                )
+                conn.commit()
+            return {"ok": True, "id": rec_id, "foto_url": foto_rel}
+        finally:
+            put_conn(conn)
 
 # =============================================================================
-# Sync Excel del mapa
+# STARTUP / SHUTDOWN
 # =============================================================================
-@app.post("/admin/sync-mapa")
-def sync_mapa():
+
+@app.on_event("startup")
+def on_startup():
     try:
-        return _sync_mapa_internal()
+        init_pool()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        log.warning(f"No se pudo inicializar pool DB al inicio: {e}")
+    log.info("Aplicación iniciada.")
+
+@app.on_event("shutdown")
+def on_shutdown():
+    global pool
+    try:
+        if pool:
+            pool.closeall()
+            log.info("Pool DB cerrado.")
+    except Exception:
+        pass
+
+# =============================================================================
+# UTIL: Export CSV/Excel (opcional) – placeholder si lo necesitas luego
+# =============================================================================
+# Aquí podrías mantener tus endpoints de exportación, limpieza, etc.
