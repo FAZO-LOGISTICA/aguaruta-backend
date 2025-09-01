@@ -14,6 +14,7 @@ import os
 import math
 import datetime as dt
 import uuid
+import time
 from pathlib import Path
 
 # -----------------------------------------------------------------------------
@@ -23,35 +24,82 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise ValueError("❌ DATABASE_URL no está configurada en variables de entorno")
 
-# Forzar sslmode=require si no viene y endurecer conexión (keepalives)
-if "sslmode=" not in DATABASE_URL:
-    DATABASE_URL += ("&sslmode=require" if "?" in DATABASE_URL else "?sslmode=require")
+# Forzar sslmode=require y connect_timeout si no vienen
+def _augment_dsn(url: str) -> str:
+    out = url
+    if "sslmode=" not in out:
+        out += ("&sslmode=require" if "?" in out else "?sslmode=require")
+    if "connect_timeout=" not in out:
+        out += ("&connect_timeout=5" if "?" in out else "?connect_timeout=5")
+    # Etiqueta útil en PG para ver quién se conecta
+    if "application_name=" not in out:
+        out += ("&application_name=aguaruta-api" if "?" in out else "?application_name=aguaruta-api")
+    return out
 
-pool = SimpleConnectionPool(
-    1, 20,
-    dsn=DATABASE_URL,
-    keepalives=1,
-    keepalives_idle=30,
-    keepalives_interval=10,
-    keepalives_count=5,
-)
+DATABASE_URL = _augment_dsn(DATABASE_URL)
 
-app = FastAPI(title="AguaRuta API", version="3.2.1")
+app = FastAPI(title="AguaRuta API", version="3.2.2")
 
-# CORS (Netlify + local dev)
+# CORS (Netlify + local dev) — evita "*" con credentials
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://aguaruta.netlify.app",
         "http://localhost:3000",
         "http://localhost:5173",
-        # Descomenta si pruebas Expo web en local
-        # "http://localhost:19006",
+        # "http://localhost:19006",  # descomenta si usas Expo Web
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# -----------------------------------------------------------------------------
+# Pool de conexiones (lazy) + retries
+# -----------------------------------------------------------------------------
+_pool: Optional[SimpleConnectionPool] = None
+
+def _init_pool_with_retries(max_attempts: int = 6) -> None:
+    """Inicializa el pool con reintentos exponenciales sin botar el proceso."""
+    global _pool
+    if _pool is not None:
+        return
+    last_err = None
+    for attempt in range(max_attempts):
+        try:
+            _pool = SimpleConnectionPool(
+                1, 20,
+                dsn=DATABASE_URL,
+                keepalives=1,
+                keepalives_idle=30,
+                keepalives_interval=10,
+                keepalives_count=5,
+            )
+            # Smoke test para asegurar handshake OK
+            conn = _pool.getconn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1;")
+                    cur.fetchone()
+            finally:
+                _pool.putconn(conn)
+            return
+        except Exception as e:
+            last_err = e
+            # pequeño backoff: 1,2,4,8,10,10
+            sleep_s = min(10, 2 ** attempt)
+            time.sleep(sleep_s)
+    # Si no se pudo, dejamos _pool en None y levantamos la última excepción
+    raise last_err  # será manejada por quien llame
+
+@app.on_event("startup")
+def _startup_try_pool():
+    # Intentar crear pool al arrancar, pero sin botar el servicio si falla
+    try:
+        _init_pool_with_retries(max_attempts=3)
+    except Exception as e:
+        # Log suave; los endpoints intentarán de nuevo al primer uso.
+        print(f"[WARN] No se pudo inicializar el pool en startup: {e}")
 
 # -----------------------------------------------------------------------------
 # Archivos estáticos (fotos locales opcionales)
@@ -60,11 +108,9 @@ UPLOAD_ROOT = Path(os.getenv("UPLOAD_ROOT", "uploads")).resolve()
 UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=str(UPLOAD_ROOT)), name="uploads")
 
-
 def _safe_ext(filename: str) -> str:
     ext = (filename or "").split(".")[-1].lower()
     return ext if ext in {"jpg", "jpeg", "png", "webp"} else "jpg"
-
 
 def _save_upload_file(f: UploadFile, subdir: str = "evidencias") -> str:
     """Guarda UploadFile en /uploads/<subdir>/YYYY/MM/ y retorna ruta web '/uploads/...'.
@@ -83,8 +129,19 @@ def _save_upload_file(f: UploadFile, subdir: str = "evidencias") -> str:
 # -----------------------------------------------------------------------------
 # Helpers DB
 # -----------------------------------------------------------------------------
+def _get_pool_or_503() -> SimpleConnectionPool:
+    global _pool
+    if _pool is None:
+        try:
+            _init_pool_with_retries(max_attempts=6)
+        except Exception as e:
+            # No botamos el proceso; reportamos 503 al cliente
+            raise HTTPException(status_code=503, detail=f"Base de datos no disponible: {e}")
+    return _pool
+
 @contextmanager
 def get_conn_cursor():
+    pool = _get_pool_or_503()
     conn = pool.getconn()
     try:
         with conn.cursor() as cur:
@@ -95,7 +152,6 @@ def get_conn_cursor():
         raise e
     finally:
         pool.putconn(conn)
-
 
 def _rows_to_dicts(cur, rows):
     cols = [d[0] for d in cur.description]
@@ -112,7 +168,6 @@ def _to_float_or_none(x):
     except Exception:
         return None
 
-
 def _to_int_or_none(x):
     v = _to_float_or_none(x)
     if v is None:
@@ -122,13 +177,11 @@ def _to_int_or_none(x):
     except Exception:
         return None
 
-
 def _valid_lat_lon(lat, lon) -> bool:
     try:
         return (-90.0 <= float(lat) <= 90.0) and (-180.0 <= float(lon) <= 180.0)
     except Exception:
         return False
-
 
 def _haversine_km(lat1, lon1, lat2, lon2) -> float:
     R = 6371.0
@@ -136,15 +189,13 @@ def _haversine_km(lat1, lon1, lat2, lon2) -> float:
     p2 = math.radians(lat2)
     dlat = math.radians(lat2 - lat1)
     dlon = math.radians(lon2 - lon1)
-    a = math.sin(dlat / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlon / 2) ** 2
+    a = math.sin(dlat/2)**2 + math.cos(p1) * math.cos(p2) * math.sin(dlon/2)**2
     c = 2 * math.asin(math.sqrt(a))
     return R * c
 
-
 def _today_str_tzcl():
-    # Fecha de Chile con manejo DST real
+    # Fecha de Chile (maneja DST)
     return dt.datetime.now(ZoneInfo("America/Santiago")).date().isoformat()
-
 
 def _get_first(data: Dict, *keys, cast="float"):
     for k in keys:
@@ -155,10 +206,8 @@ def _get_first(data: Dict, *keys, cast="float"):
 # -----------------------------------------------------------------------------
 # Rutas/paths de datos (Excel oficial del mapa)
 # -----------------------------------------------------------------------------
-DATA_DIR = Path("data")
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR = Path("data"); DATA_DIR.mkdir(parents=True, exist_ok=True)
 MAP_XLSX = DATA_DIR / "base_datos_todos_con_coordenadas.xlsx"  # nombre oficial
-
 
 def _sync_mapa_internal() -> Dict:
     """
@@ -176,10 +225,8 @@ def _sync_mapa_internal() -> Dict:
 
     df = pd.DataFrame(rows, columns=cols)
     if df.empty:
-        # mantiene archivo vacío/previo, pero retornamos estado
         return {"ok": False, "puntos_exportados": 0, "archivo": str(MAP_XLSX)}
 
-    # Normalizar y validar (punto decimal, rangos)
     for c in ["latitud", "longitud", "litros"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df[
@@ -187,8 +234,6 @@ def _sync_mapa_internal() -> Dict:
         df["longitud"].between(-180, 180)
     ]
 
-    # Escribir hoja "puntos" con columnas exactas usadas por el mapa
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(MAP_XLSX, engine="openpyxl") as w:
         df.to_excel(w, index=False, sheet_name="puntos")
 
@@ -211,12 +256,9 @@ except Exception:
 def health():
     return {"status": "ok"}
 
-
-# Alias para monitores externos (UptimeRobot/Expo background)
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
-
 
 # Ping real a la DB
 @app.get("/db/ping")
@@ -226,6 +268,9 @@ def db_ping():
             cur.execute("SELECT 1;")
             cur.fetchone()
         return {"ok": True}
+    except HTTPException as he:
+        # Propaga 503 con el texto amigable
+        raise he
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -234,9 +279,6 @@ def db_ping():
 # -----------------------------------------------------------------------------
 @app.get("/rutas-activas")
 def obtener_rutas_activas(camion: Optional[str] = None, dia: Optional[str] = None):
-    """
-    Opcionalmente filtra por camión y/o día (case-insensitive).
-    """
     try:
         where = []
         params: List[str] = []
@@ -257,9 +299,10 @@ def obtener_rutas_activas(camion: Optional[str] = None, dia: Optional[str] = Non
             """, params)
             filas = cur.fetchall()
             return _rows_to_dicts(cur, filas)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.put("/rutas-activas/{id}")
 def editar_ruta_activa(id: int, data: Dict):
@@ -272,7 +315,6 @@ def editar_ruta_activa(id: int, data: Dict):
             cur.execute(f"UPDATE ruta_activa SET {sets} WHERE id = %s", values)
             if cur.rowcount == 0:
                 raise HTTPException(status_code=404, detail="Registro no encontrado")
-        # 🔁 Autosync mapa (no bloqueante)
         try:
             _sync_mapa_internal()
         except Exception:
@@ -282,7 +324,6 @@ def editar_ruta_activa(id: int, data: Dict):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 # Compat:
 @app.put("/editar-ruta")
@@ -304,7 +345,6 @@ def editar_ruta_legacy(payload: Dict):
             cur.execute(f"UPDATE ruta_activa SET {sets} WHERE id = %s", values)
             if cur.rowcount == 0:
                 raise HTTPException(status_code=404, detail="Registro no encontrado")
-        # 🔁 Autosync mapa
         try:
             _sync_mapa_internal()
         except Exception:
@@ -314,7 +354,6 @@ def editar_ruta_legacy(payload: Dict):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.put("/editar-ruta/{id}")
 def editar_ruta_legacy_with_id(id: int, payload: Dict):
@@ -379,7 +418,6 @@ def importar_ruta_activa_file(
                 VALUES %s
             """, rows)
 
-        # 🔁 Autosync mapa tras importar masivo
         try:
             _sync_mapa_internal()
         except Exception:
@@ -437,7 +475,6 @@ def registrar_nuevo_punto(data: Dict):
                 data.get("latitud"), data.get("longitud")
             ))
             new_id = cur.fetchone()[0]
-        # 🔁 Autosync
         try:
             _sync_mapa_internal()
         except Exception:
@@ -445,7 +482,6 @@ def registrar_nuevo_punto(data: Dict):
         return {"mensaje": "✅ Nuevo punto registrado en ruta activa", "id": new_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.post("/registrar-nuevo-punto-auto")
 def registrar_nuevo_punto_auto(data: Dict):
@@ -500,7 +536,6 @@ def registrar_nuevo_punto_auto(data: Dict):
             """, (camion_final, nombre, dia_final, litros, telefono, lat, lon))
             new_id = cur.fetchone()[0]
 
-        # 🔁 Autosync
         try:
             _sync_mapa_internal()
         except Exception:
@@ -535,8 +570,6 @@ def obtener_entregas_app():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
-# JSON (compat): acepta alias gps_lat/gps_lng
 @app.post("/entregas-app")
 def registrar_entrega_json(data: Dict):
     try:
@@ -560,8 +593,6 @@ def registrar_entrega_json(data: Dict):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
-# MULTIPART (con foto real → guarda local si no usas Cloudinary)
 @app.post("/entregas-app-form")
 async def registrar_entrega_form(
     nombre: str = Form(...),
@@ -631,7 +662,6 @@ def listar_entregas(
             return _rows_to_dicts(cur, rows)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.get("/entregas/no-entregadas")
 def listar_no_entregadas(
@@ -719,7 +749,6 @@ def limpiar_tablas():
     try:
         with get_conn_cursor() as (_, cur):
             cur.execute("TRUNCATE TABLE ruta_activa;")
-        # sync en blanco
         try:
             _sync_mapa_internal()
         except Exception:
@@ -727,7 +756,6 @@ def limpiar_tablas():
         return {"mensaje": "✅ Tabla ruta_activa limpiada"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.post("/admin/drop-redistribucion")
 def drop_redistribucion():
@@ -737,7 +765,6 @@ def drop_redistribucion():
         return {"mensaje": "✅ Tabla redistribucion eliminada (si existía)"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.post("/admin/migrar-entregas-app")
 def migrar_entregas_app():
@@ -772,7 +799,7 @@ def migrar_entregas_app():
             """)
         return {"ok": True, "mensaje": "✅ Migración aplicada (entregas_app)"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail:str(e))
 
 # -----------------------------------------------------------------------------
 # ✅ Endpoint público para sincronizar Excel del mapa
