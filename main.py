@@ -7,6 +7,7 @@ from typing import Dict, Optional, List
 from contextlib import contextmanager
 from psycopg2.pool import SimpleConnectionPool
 from psycopg2.extras import execute_values
+from zoneinfo import ZoneInfo
 import pandas as pd
 import io
 import os
@@ -22,19 +23,30 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise ValueError("❌ DATABASE_URL no está configurada en variables de entorno")
 
-# Render requiere SSL
-pool = SimpleConnectionPool(1, 20, dsn=DATABASE_URL, sslmode="require")
+# Forzar sslmode=require si no viene y endurecer conexión (keepalives)
+if "sslmode=" not in DATABASE_URL:
+    DATABASE_URL += ("&sslmode=require" if "?" in DATABASE_URL else "?sslmode=require")
 
-app = FastAPI(title="AguaRuta API", version="3.2.0")
+pool = SimpleConnectionPool(
+    1, 20,
+    dsn=DATABASE_URL,
+    keepalives=1,
+    keepalives_idle=30,
+    keepalives_interval=10,
+    keepalives_count=5,
+)
 
-# CORS (Netlify + local dev + Expo)
+app = FastAPI(title="AguaRuta API", version="3.2.1")
+
+# CORS (Netlify + local dev)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://aguaruta.netlify.app",
         "http://localhost:3000",
         "http://localhost:5173",
-        "*",  # móviles en pruebas
+        # Descomenta si pruebas Expo web en local
+        # "http://localhost:19006",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -48,9 +60,11 @@ UPLOAD_ROOT = Path(os.getenv("UPLOAD_ROOT", "uploads")).resolve()
 UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=str(UPLOAD_ROOT)), name="uploads")
 
+
 def _safe_ext(filename: str) -> str:
     ext = (filename or "").split(".")[-1].lower()
     return ext if ext in {"jpg", "jpeg", "png", "webp"} else "jpg"
+
 
 def _save_upload_file(f: UploadFile, subdir: str = "evidencias") -> str:
     """Guarda UploadFile en /uploads/<subdir>/YYYY/MM/ y retorna ruta web '/uploads/...'.
@@ -73,14 +87,15 @@ def _save_upload_file(f: UploadFile, subdir: str = "evidencias") -> str:
 def get_conn_cursor():
     conn = pool.getconn()
     try:
-        cur = conn.cursor()
-        yield conn, cur
-        conn.commit()
+        with conn.cursor() as cur:
+            yield conn, cur
+            conn.commit()
     except Exception as e:
         conn.rollback()
         raise e
     finally:
         pool.putconn(conn)
+
 
 def _rows_to_dicts(cur, rows):
     cols = [d[0] for d in cur.description]
@@ -97,6 +112,7 @@ def _to_float_or_none(x):
     except Exception:
         return None
 
+
 def _to_int_or_none(x):
     v = _to_float_or_none(x)
     if v is None:
@@ -106,11 +122,13 @@ def _to_int_or_none(x):
     except Exception:
         return None
 
+
 def _valid_lat_lon(lat, lon) -> bool:
     try:
         return (-90.0 <= float(lat) <= 90.0) and (-180.0 <= float(lon) <= 180.0)
     except Exception:
         return False
+
 
 def _haversine_km(lat1, lon1, lat2, lon2) -> float:
     R = 6371.0
@@ -118,13 +136,15 @@ def _haversine_km(lat1, lon1, lat2, lon2) -> float:
     p2 = math.radians(lat2)
     dlat = math.radians(lat2 - lat1)
     dlon = math.radians(lon2 - lon1)
-    a = math.sin(dlat/2)**2 + math.cos(p1) * math.cos(p2) * math.sin(dlon/2)**2
+    a = math.sin(dlat / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlon / 2) ** 2
     c = 2 * math.asin(math.sqrt(a))
     return R * c
 
+
 def _today_str_tzcl():
-    # Fecha de Chile (para filtros diarios en reportes)
-    return dt.datetime.now(dt.timezone(dt.timedelta(hours=-4))).date().isoformat()
+    # Fecha de Chile con manejo DST real
+    return dt.datetime.now(ZoneInfo("America/Santiago")).date().isoformat()
+
 
 def _get_first(data: Dict, *keys, cast="float"):
     for k in keys:
@@ -135,8 +155,10 @@ def _get_first(data: Dict, *keys, cast="float"):
 # -----------------------------------------------------------------------------
 # Rutas/paths de datos (Excel oficial del mapa)
 # -----------------------------------------------------------------------------
-DATA_DIR = Path("data"); DATA_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 MAP_XLSX = DATA_DIR / "base_datos_todos_con_coordenadas.xlsx"  # nombre oficial
+
 
 def _sync_mapa_internal() -> Dict:
     """
@@ -189,10 +211,23 @@ except Exception:
 def health():
     return {"status": "ok"}
 
+
 # Alias para monitores externos (UptimeRobot/Expo background)
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
+
+
+# Ping real a la DB
+@app.get("/db/ping")
+def db_ping():
+    try:
+        with get_conn_cursor() as (_, cur):
+            cur.execute("SELECT 1;")
+            cur.fetchone()
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 # -----------------------------------------------------------------------------
 # RUTA ACTIVA — listar / editar
@@ -225,6 +260,7 @@ def obtener_rutas_activas(camion: Optional[str] = None, dia: Optional[str] = Non
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.put("/rutas-activas/{id}")
 def editar_ruta_activa(id: int, data: Dict):
     try:
@@ -246,6 +282,7 @@ def editar_ruta_activa(id: int, data: Dict):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 # Compat:
 @app.put("/editar-ruta")
@@ -277,6 +314,7 @@ def editar_ruta_legacy(payload: Dict):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.put("/editar-ruta/{id}")
 def editar_ruta_legacy_with_id(id: int, payload: Dict):
@@ -408,6 +446,7 @@ def registrar_nuevo_punto(data: Dict):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.post("/registrar-nuevo-punto-auto")
 def registrar_nuevo_punto_auto(data: Dict):
     try:
@@ -496,6 +535,7 @@ def obtener_entregas_app():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 # JSON (compat): acepta alias gps_lat/gps_lng
 @app.post("/entregas-app")
 def registrar_entrega_json(data: Dict):
@@ -519,6 +559,7 @@ def registrar_entrega_json(data: Dict):
         return {"mensaje": "✅ Entrega registrada correctamente"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 # MULTIPART (con foto real → guarda local si no usas Cloudinary)
 @app.post("/entregas-app-form")
@@ -590,6 +631,7 @@ def listar_entregas(
             return _rows_to_dicts(cur, rows)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/entregas/no-entregadas")
 def listar_no_entregadas(
@@ -686,6 +728,7 @@ def limpiar_tablas():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.post("/admin/drop-redistribucion")
 def drop_redistribucion():
     try:
@@ -694,6 +737,7 @@ def drop_redistribucion():
         return {"mensaje": "✅ Tabla redistribucion eliminada (si existía)"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/admin/migrar-entregas-app")
 def migrar_entregas_app():
@@ -731,7 +775,7 @@ def migrar_entregas_app():
         raise HTTPException(status_code=500, detail=str(e))
 
 # -----------------------------------------------------------------------------
-# ✅ Nuevo endpoint público para sincronizar Excel del mapa
+# ✅ Endpoint público para sincronizar Excel del mapa
 # -----------------------------------------------------------------------------
 @app.post("/admin/sync-mapa")
 def sync_mapa():
