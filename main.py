@@ -14,6 +14,8 @@ import math
 import datetime as dt
 import uuid
 import time
+import threading
+import asyncio
 from pathlib import Path
 
 # =============================================================================
@@ -28,7 +30,6 @@ def _augment_dsn(url: str) -> str:
     if "sslmode=" not in out:
         out += ("&sslmode=require" if "?" in out else "?sslmode=require")
     if "connect_timeout=" not in out:
-        # valor por defecto de arranque; en peticiones se puede sobreescribir por kwarg
         out += ("&connect_timeout=5" if "?" in out else "?connect_timeout=5")
     if "application_name=" not in out:
         out += ("&application_name=aguaruta-api" if "?" in out else "?application_name=aguaruta-api")
@@ -37,22 +38,22 @@ def _augment_dsn(url: str) -> str:
 DATABASE_URL = _augment_dsn(DATABASE_URL)
 
 # Reintentos y timeouts configurables por ENV
-REQUEST_POOL_MAX_ATTEMPTS = int(os.getenv("DB_REQUEST_ATTEMPTS", "2"))            # fail-fast en request
-REQUEST_CONNECT_TIMEOUT   = int(os.getenv("DB_REQUEST_CONNECT_TIMEOUT", "3"))     # segundos por intento en request
-STARTUP_POOL_MAX_ATTEMPTS = int(os.getenv("DB_STARTUP_ATTEMPTS", "3"))            # al iniciar el servicio
-STARTUP_CONNECT_TIMEOUT   = int(os.getenv("DB_STARTUP_CONNECT_TIMEOUT", "5"))     # segundos por intento en startup
-POOL_MAX_CONN             = int(os.getenv("DB_POOL_MAX_CONN", "10"))              # 10 recomendado en Render Hobby
+REQUEST_POOL_MAX_ATTEMPTS = int(os.getenv("DB_REQUEST_ATTEMPTS", "2"))         # fail-fast
+REQUEST_CONNECT_TIMEOUT   = int(os.getenv("DB_REQUEST_CONNECT_TIMEOUT", "3"))  # seg por intento
+STARTUP_POOL_MAX_ATTEMPTS = int(os.getenv("DB_STARTUP_ATTEMPTS", "3"))         # al iniciar
+STARTUP_CONNECT_TIMEOUT   = int(os.getenv("DB_STARTUP_CONNECT_TIMEOUT", "5"))  # seg por intento
+POOL_MAX_CONN             = int(os.getenv("DB_POOL_MAX_CONN", "10"))           # Render Hobby ≈10
+KEEPALIVE_SECONDS         = int(os.getenv("DB_KEEPALIVE_SECONDS", "120"))      # ping periódico
 
-app = FastAPI(title="AguaRuta API", version="3.2.4")
+app = FastAPI(title="AguaRuta API", version="3.3.0")
 
-# CORS (Netlify + local dev) — evitar "*" con credentials
+# CORS (Netlify + local dev)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://aguaruta.netlify.app",
         "http://localhost:3000",
         "http://localhost:5173",
-        # "http://localhost:19006",  # Expo Web si lo usas
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -60,15 +61,17 @@ app.add_middleware(
 )
 
 # =============================================================================
-# Pool de conexiones (lazy) + retries
+# Pool de conexiones (lazy) + retries + warmup en background
 # =============================================================================
 _pool: Optional[SimpleConnectionPool] = None
+_bg_booting = False
+_bg_lock = threading.Lock()
 
 def _init_pool_with_retries(max_attempts: int = 6, connect_timeout: int | None = None) -> None:
     """
     Inicializa el pool con reintentos exponenciales.
-    - En startup: intenta más (pero no cae la app).
-    - En request: intenta poco (fail-fast) y responde 503 si no conecta.
+    - Startup: más intentos (pero no cae la app).
+    - Request: pocos intentos -> fail-fast y 503 rápido.
     """
     global _pool
     if _pool is not None:
@@ -96,9 +99,26 @@ def _init_pool_with_retries(max_attempts: int = 6, connect_timeout: int | None =
             return
         except Exception as e:
             last_err = e
-            # backoff 1,2,4,8,10,...
-            time.sleep(min(10, 2 ** attempt))
+            time.sleep(min(10, 2 ** attempt))  # 1,2,4,8,10...
     raise last_err
+
+def _bg_warmup():
+    """Intenta levantar el pool en segundo plano con más paciencia."""
+    global _bg_booting
+    try:
+        _init_pool_with_retries(max_attempts=12, connect_timeout=10)
+    finally:
+        with _bg_lock:
+            _bg_booting = False
+
+def _kick_bg_warmup():
+    """Lanza un hilo de warmup si no hay uno corriendo."""
+    global _bg_booting
+    with _bg_lock:
+        if not _bg_booting and _pool is None:
+            _bg_booting = True
+            t = threading.Thread(target=_bg_warmup, daemon=True)
+            t.start()
 
 @app.on_event("startup")
 def _startup_try_pool():
@@ -109,6 +129,29 @@ def _startup_try_pool():
         )
     except Exception as e:
         print(f"[WARN] No se pudo inicializar el pool en startup: {e}")
+        _kick_bg_warmup()  # deja intentando por detrás
+
+@app.on_event("startup")
+async def _db_keepalive_task():
+    async def tick():
+        while True:
+            try:
+                # ping suave; si falla, disparamos warmup
+                pool = _pool
+                if pool is not None:
+                    conn = pool.getconn()
+                    try:
+                        with conn.cursor() as cur:
+                            cur.execute("SELECT 1;")
+                    finally:
+                        pool.putconn(conn)
+                else:
+                    # si aún no hay pool, intenta levantar por detrás
+                    _kick_bg_warmup()
+            except Exception:
+                _kick_bg_warmup()
+            await asyncio.sleep(KEEPALIVE_SECONDS)
+    asyncio.create_task(tick())
 
 # =============================================================================
 # Archivos estáticos (fotos locales)
@@ -145,7 +188,7 @@ def _get_pool_or_503() -> SimpleConnectionPool:
                 connect_timeout=REQUEST_CONNECT_TIMEOUT
             )
         except Exception as e:
-            # responder rápido para que el frontend no timeoutee
+            _kick_bg_warmup()  # sigue intentando en background
             raise HTTPException(status_code=503, detail=f"Base de datos no disponible: {e}")
     return _pool
 
@@ -213,7 +256,7 @@ def _get_first(data: Dict, *keys, cast="float"):
     return None
 
 # =============================================================================
-# Rutas/paths de datos (Excel del mapa)
+# Datos mapa (Excel)
 # =============================================================================
 DATA_DIR = Path("data"); DATA_DIR.mkdir(parents=True, exist_ok=True)
 MAP_XLSX = DATA_DIR / "base_datos_todos_con_coordenadas.xlsx"
@@ -245,7 +288,7 @@ def _sync_mapa_internal() -> Dict:
     return {"ok": True, "puntos_exportados": int(len(df)), "archivo": str(MAP_XLSX)}
 
 # =============================================================================
-# Routers externos (Cloudinary sign opcional)
+# Routers externos (Cloudinary opcional)
 # =============================================================================
 try:
     from routers.cloudinary import router as cloudinary_router
@@ -254,7 +297,7 @@ except Exception:
     pass
 
 # =============================================================================
-# Salud
+# Salud / Diagnóstico
 # =============================================================================
 @app.get("/")
 def root():
@@ -279,6 +322,10 @@ def db_ping():
         raise he
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+@app.get("/status")
+def status():
+    return {"api": True, "pool_ready": _pool is not None}
 
 # =============================================================================
 # RUTA ACTIVA — listar / editar
@@ -368,7 +415,7 @@ def editar_ruta_legacy_with_id(id: int, payload: Dict):
     return editar_ruta_legacy(payload)
 
 # =============================================================================
-# IMPORTAR RUTA ACTIVA desde CSV/XLSX (reemplaza todo)
+# IMPORTAR RUTA ACTIVA (CSV/XLSX)
 # =============================================================================
 @app.post("/admin/importar-ruta-activa-file")
 def importar_ruta_activa_file(
@@ -700,7 +747,7 @@ def listar_no_entregadas(
         raise HTTPException(status_code=500, detail=str(e))
 
 # =============================================================================
-# ESTADOS DEL DÍA (para pintar verde/rojo)
+# ESTADOS DEL DÍA
 # =============================================================================
 @app.get("/estados-dia")
 def estados_del_dia(
