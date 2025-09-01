@@ -1,3 +1,4 @@
+# backend/main.py
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -6,7 +7,6 @@ from typing import Dict, Optional, List
 from contextlib import contextmanager
 from psycopg2.pool import SimpleConnectionPool
 from psycopg2.extras import execute_values
-from zoneinfo import ZoneInfo
 import pandas as pd
 import io
 import os
@@ -37,23 +37,24 @@ def _augment_dsn(url: str) -> str:
 
 DATABASE_URL = _augment_dsn(DATABASE_URL)
 
-# Reintentos y timeouts configurables por ENV
+# Reintentos/timeouts por request vs startup
 REQUEST_POOL_MAX_ATTEMPTS = int(os.getenv("DB_REQUEST_ATTEMPTS", "2"))         # fail-fast
 REQUEST_CONNECT_TIMEOUT   = int(os.getenv("DB_REQUEST_CONNECT_TIMEOUT", "3"))  # seg por intento
 STARTUP_POOL_MAX_ATTEMPTS = int(os.getenv("DB_STARTUP_ATTEMPTS", "3"))         # al iniciar
 STARTUP_CONNECT_TIMEOUT   = int(os.getenv("DB_STARTUP_CONNECT_TIMEOUT", "5"))  # seg por intento
-POOL_MAX_CONN             = int(os.getenv("DB_POOL_MAX_CONN", "10"))           # Render Hobby ≈10
+POOL_MAX_CONN             = int(os.getenv("DB_POOL_MAX_CONN", "10"))           # hobby ~10
 KEEPALIVE_SECONDS         = int(os.getenv("DB_KEEPALIVE_SECONDS", "120"))      # ping periódico
 
 app = FastAPI(title="AguaRuta API", version="3.3.0")
 
-# CORS (Netlify + local dev)
+# CORS (Netlify + local + móviles en pruebas)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://aguaruta.netlify.app",
         "http://localhost:3000",
         "http://localhost:5173",
+        "*",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -67,12 +68,8 @@ _pool: Optional[SimpleConnectionPool] = None
 _bg_booting = False
 _bg_lock = threading.Lock()
 
-def _init_pool_with_retries(max_attempts: int = 6, connect_timeout: int | None = None) -> None:
-    """
-    Inicializa el pool con reintentos exponenciales.
-    - Startup: más intentos (pero no cae la app).
-    - Request: pocos intentos -> fail-fast y 503 rápido.
-    """
+def _init_pool_with_retries(max_attempts: int = 6, connect_timeout: Optional[int] = None) -> None:
+    """Inicializa el pool con reintentos exponenciales."""
     global _pool
     if _pool is not None:
         return
@@ -103,7 +100,7 @@ def _init_pool_with_retries(max_attempts: int = 6, connect_timeout: int | None =
     raise last_err
 
 def _bg_warmup():
-    """Intenta levantar el pool en segundo plano con más paciencia."""
+    """Sigue intentando en segundo plano levantar el pool."""
     global _bg_booting
     try:
         _init_pool_with_retries(max_attempts=12, connect_timeout=10)
@@ -112,13 +109,12 @@ def _bg_warmup():
             _bg_booting = False
 
 def _kick_bg_warmup():
-    """Lanza un hilo de warmup si no hay uno corriendo."""
+    """Dispara el warmup si no hay uno activo."""
     global _bg_booting
     with _bg_lock:
         if not _bg_booting and _pool is None:
             _bg_booting = True
-            t = threading.Thread(target=_bg_warmup, daemon=True)
-            t.start()
+            threading.Thread(target=_bg_warmup, daemon=True).start()
 
 @app.on_event("startup")
 def _startup_try_pool():
@@ -128,25 +124,22 @@ def _startup_try_pool():
             connect_timeout=STARTUP_CONNECT_TIMEOUT
         )
     except Exception as e:
-        print(f"[WARN] No se pudo inicializar el pool en startup: {e}")
-        _kick_bg_warmup()  # deja intentando por detrás
+        print(f"[WARN] No se pudo inicializar el pool al inicio: {e}")
+        _kick_bg_warmup()
 
 @app.on_event("startup")
 async def _db_keepalive_task():
     async def tick():
         while True:
             try:
-                # ping suave; si falla, disparamos warmup
-                pool = _pool
-                if pool is not None:
-                    conn = pool.getconn()
+                if _pool is not None:
+                    conn = _pool.getconn()
                     try:
                         with conn.cursor() as cur:
                             cur.execute("SELECT 1;")
                     finally:
-                        pool.putconn(conn)
+                        _pool.putconn(conn)
                 else:
-                    # si aún no hay pool, intenta levantar por detrás
                     _kick_bg_warmup()
             except Exception:
                 _kick_bg_warmup()
@@ -188,7 +181,7 @@ def _get_pool_or_503() -> SimpleConnectionPool:
                 connect_timeout=REQUEST_CONNECT_TIMEOUT
             )
         except Exception as e:
-            _kick_bg_warmup()  # sigue intentando en background
+            _kick_bg_warmup()
             raise HTTPException(status_code=503, detail=f"Base de datos no disponible: {e}")
     return _pool
 
@@ -196,14 +189,18 @@ def _get_pool_or_503() -> SimpleConnectionPool:
 def get_conn_cursor():
     pool = _get_pool_or_503()
     conn = pool.getconn()
+    cur = conn.cursor()
     try:
-        with conn.cursor() as cur:
-            yield conn, cur
-            conn.commit()
+        yield conn, cur
+        conn.commit()
     except Exception as e:
         conn.rollback()
         raise e
     finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
         pool.putconn(conn)
 
 def _rows_to_dicts(cur, rows):
@@ -247,7 +244,8 @@ def _haversine_km(lat1, lon1, lat2, lon2) -> float:
     return R * c
 
 def _today_str_tzcl():
-    return dt.datetime.now(ZoneInfo("America/Santiago")).date().isoformat()
+    # Usamos -4 fijo para simplicidad (Chile continental)
+    return dt.datetime.now(dt.timezone(dt.timedelta(hours=-4))).date().isoformat()
 
 def _get_first(data: Dict, *keys, cast="float"):
     for k in keys:
@@ -277,10 +275,7 @@ def _sync_mapa_internal() -> Dict:
 
     for c in ["latitud", "longitud", "litros"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df[
-        df["latitud"].between(-90, 90) &
-        df["longitud"].between(-180, 180)
-    ]
+    df = df[df["latitud"].between(-90, 90) & df["longitud"].between(-180, 180)]
 
     with pd.ExcelWriter(MAP_XLSX, engine="openpyxl") as w:
         df.to_excel(w, index=False, sheet_name="puntos")
@@ -311,6 +306,10 @@ def health():
 def healthz():
     return {"ok": True}
 
+@app.get("/status")
+def status():
+    return {"api": True, "pool_ready": _pool is not None}
+
 @app.get("/db/ping")
 def db_ping():
     try:
@@ -321,11 +320,8 @@ def db_ping():
     except HTTPException as he:
         raise he
     except Exception as e:
+        _kick_bg_warmup()
         return {"ok": False, "error": str(e)}
-
-@app.get("/status")
-def status():
-    return {"api": True, "pool_ready": _pool is not None}
 
 # =============================================================================
 # RUTA ACTIVA — listar / editar
