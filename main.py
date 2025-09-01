@@ -16,9 +16,9 @@ import uuid
 import time
 from pathlib import Path
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Configuración inicial
-# -----------------------------------------------------------------------------
+# =============================================================================
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise ValueError("❌ DATABASE_URL no está configurada en variables de entorno")
@@ -28,6 +28,7 @@ def _augment_dsn(url: str) -> str:
     if "sslmode=" not in out:
         out += ("&sslmode=require" if "?" in out else "?sslmode=require")
     if "connect_timeout=" not in out:
+        # valor por defecto de arranque; en peticiones se puede sobreescribir por kwarg
         out += ("&connect_timeout=5" if "?" in out else "?connect_timeout=5")
     if "application_name=" not in out:
         out += ("&application_name=aguaruta-api" if "?" in out else "?application_name=aguaruta-api")
@@ -35,29 +36,40 @@ def _augment_dsn(url: str) -> str:
 
 DATABASE_URL = _augment_dsn(DATABASE_URL)
 
-app = FastAPI(title="AguaRuta API", version="3.2.3")
+# Reintentos y timeouts configurables por ENV
+REQUEST_POOL_MAX_ATTEMPTS = int(os.getenv("DB_REQUEST_ATTEMPTS", "2"))            # fail-fast en request
+REQUEST_CONNECT_TIMEOUT   = int(os.getenv("DB_REQUEST_CONNECT_TIMEOUT", "3"))     # segundos por intento en request
+STARTUP_POOL_MAX_ATTEMPTS = int(os.getenv("DB_STARTUP_ATTEMPTS", "3"))            # al iniciar el servicio
+STARTUP_CONNECT_TIMEOUT   = int(os.getenv("DB_STARTUP_CONNECT_TIMEOUT", "5"))     # segundos por intento en startup
+POOL_MAX_CONN             = int(os.getenv("DB_POOL_MAX_CONN", "10"))              # 10 recomendado en Render Hobby
 
-# CORS (Netlify + local dev) — evita "*" con credentials
+app = FastAPI(title="AguaRuta API", version="3.2.4")
+
+# CORS (Netlify + local dev) — evitar "*" con credentials
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://aguaruta.netlify.app",
         "http://localhost:3000",
         "http://localhost:5173",
-        # "http://localhost:19006",  # descomentar si usas Expo Web
+        # "http://localhost:19006",  # Expo Web si lo usas
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Pool de conexiones (lazy) + retries
-# -----------------------------------------------------------------------------
+# =============================================================================
 _pool: Optional[SimpleConnectionPool] = None
 
-def _init_pool_with_retries(max_attempts: int = 6) -> None:
-    """Inicializa el pool con reintentos exponenciales sin botar el proceso."""
+def _init_pool_with_retries(max_attempts: int = 6, connect_timeout: int | None = None) -> None:
+    """
+    Inicializa el pool con reintentos exponenciales.
+    - En startup: intenta más (pero no cae la app).
+    - En request: intenta poco (fail-fast) y responde 503 si no conecta.
+    """
     global _pool
     if _pool is not None:
         return
@@ -65,12 +77,13 @@ def _init_pool_with_retries(max_attempts: int = 6) -> None:
     for attempt in range(max_attempts):
         try:
             _pool = SimpleConnectionPool(
-                1, 20,
+                1, POOL_MAX_CONN,
                 dsn=DATABASE_URL,
                 keepalives=1,
                 keepalives_idle=30,
                 keepalives_interval=10,
                 keepalives_count=5,
+                **({"connect_timeout": connect_timeout} if connect_timeout else {})
             )
             # Smoke test
             conn = _pool.getconn()
@@ -83,19 +96,23 @@ def _init_pool_with_retries(max_attempts: int = 6) -> None:
             return
         except Exception as e:
             last_err = e
-            time.sleep(min(10, 2 ** attempt))  # 1,2,4,8,10,10
+            # backoff 1,2,4,8,10,...
+            time.sleep(min(10, 2 ** attempt))
     raise last_err
 
 @app.on_event("startup")
 def _startup_try_pool():
     try:
-        _init_pool_with_retries(max_attempts=3)
+        _init_pool_with_retries(
+            max_attempts=STARTUP_POOL_MAX_ATTEMPTS,
+            connect_timeout=STARTUP_CONNECT_TIMEOUT
+        )
     except Exception as e:
         print(f"[WARN] No se pudo inicializar el pool en startup: {e}")
 
-# -----------------------------------------------------------------------------
-# Archivos estáticos (fotos locales opcionales)
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Archivos estáticos (fotos locales)
+# =============================================================================
 UPLOAD_ROOT = Path(os.getenv("UPLOAD_ROOT", "uploads")).resolve()
 UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=str(UPLOAD_ROOT)), name="uploads")
@@ -116,15 +133,19 @@ def _save_upload_file(f: UploadFile, subdir: str = "evidencias") -> str:
     rel = disk_path.relative_to(UPLOAD_ROOT).as_posix()
     return f"/uploads/{rel}"
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Helpers DB
-# -----------------------------------------------------------------------------
+# =============================================================================
 def _get_pool_or_503() -> SimpleConnectionPool:
     global _pool
     if _pool is None:
         try:
-            _init_pool_with_retries(max_attempts=6)
+            _init_pool_with_retries(
+                max_attempts=REQUEST_POOL_MAX_ATTEMPTS,
+                connect_timeout=REQUEST_CONNECT_TIMEOUT
+            )
         except Exception as e:
+            # responder rápido para que el frontend no timeoutee
             raise HTTPException(status_code=503, detail=f"Base de datos no disponible: {e}")
     return _pool
 
@@ -146,9 +167,9 @@ def _rows_to_dicts(cur, rows):
     cols = [d[0] for d in cur.description]
     return [dict(zip(cols, r)) for r in rows]
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Helpers numéricos y geo
-# -----------------------------------------------------------------------------
+# =============================================================================
 def _to_float_or_none(x):
     if x is None or x == "":
         return None
@@ -191,9 +212,9 @@ def _get_first(data: Dict, *keys, cast="float"):
             return _to_float_or_none(data[k]) if cast == "float" else data[k]
     return None
 
-# -----------------------------------------------------------------------------
-# Rutas/paths de datos (Excel oficial del mapa)
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Rutas/paths de datos (Excel del mapa)
+# =============================================================================
 DATA_DIR = Path("data"); DATA_DIR.mkdir(parents=True, exist_ok=True)
 MAP_XLSX = DATA_DIR / "base_datos_todos_con_coordenadas.xlsx"
 
@@ -223,18 +244,22 @@ def _sync_mapa_internal() -> Dict:
 
     return {"ok": True, "puntos_exportados": int(len(df)), "archivo": str(MAP_XLSX)}
 
-# -----------------------------------------------------------------------------
-# Routers externos (FREE Cloudinary sign)
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Routers externos (Cloudinary sign opcional)
+# =============================================================================
 try:
     from routers.cloudinary import router as cloudinary_router
     app.include_router(cloudinary_router)
 except Exception:
     pass
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Salud
-# -----------------------------------------------------------------------------
+# =============================================================================
+@app.get("/")
+def root():
+    return {"name": "AguaRuta API", "version": app.version}
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -255,9 +280,9 @@ def db_ping():
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # RUTA ACTIVA — listar / editar
-# -----------------------------------------------------------------------------
+# =============================================================================
 @app.get("/rutas-activas")
 def obtener_rutas_activas(camion: Optional[str] = None, dia: Optional[str] = None):
     try:
@@ -306,6 +331,7 @@ def editar_ruta_activa(id: int, data: Dict):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# Compat
 @app.put("/editar-ruta")
 def editar_ruta_legacy(payload: Dict):
     try:
@@ -341,9 +367,9 @@ def editar_ruta_legacy_with_id(id: int, payload: Dict):
     payload["id"] = id
     return editar_ruta_legacy(payload)
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # IMPORTAR RUTA ACTIVA desde CSV/XLSX (reemplaza todo)
-# -----------------------------------------------------------------------------
+# =============================================================================
 @app.post("/admin/importar-ruta-activa-file")
 def importar_ruta_activa_file(
     archivo: UploadFile = File(...),
@@ -351,7 +377,7 @@ def importar_ruta_activa_file(
 ):
     try:
         content = archivo.file.read()
-        nombre = archivo.filename.lower()
+        nombre = (archivo.filename or "").lower()
         if nombre.endswith(".xlsx"):
             df = pd.read_excel(io.BytesIO(content), dtype=str)
         elif nombre.endswith(".csv"):
@@ -409,9 +435,9 @@ def importar_ruta_activa_file(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # EXPORTAR RUTA ACTIVA a Excel
-# -----------------------------------------------------------------------------
+# =============================================================================
 @app.get("/exportar-excel")
 def exportar_excel():
     try:
@@ -438,9 +464,9 @@ def exportar_excel():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# -----------------------------------------------------------------------------
-# REGISTRAR NUEVO PUNTO (manual) / (auto)
-# -----------------------------------------------------------------------------
+# =============================================================================
+# REGISTRAR NUEVO PUNTO (manual / auto)
+# =============================================================================
 @app.post("/registrar-nuevo-punto")
 def registrar_nuevo_punto(data: Dict):
     try:
@@ -533,9 +559,9 @@ def registrar_nuevo_punto_auto(data: Dict):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # ENTREGAS APP (historial y registro)
-# -----------------------------------------------------------------------------
+# =============================================================================
 @app.get("/entregas-app")
 def obtener_entregas_app():
     try:
@@ -603,9 +629,9 @@ async def registrar_entrega_form(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # SHIMs de listados
-# -----------------------------------------------------------------------------
+# =============================================================================
 @app.get("/entregas")
 def listar_entregas(
     desde: Optional[str] = None,
@@ -673,9 +699,9 @@ def listar_no_entregadas(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# -----------------------------------------------------------------------------
-# NUEVO: ESTADOS DEL DÍA (para pintar verde/rojo en la app)
-# -----------------------------------------------------------------------------
+# =============================================================================
+# ESTADOS DEL DÍA (para pintar verde/rojo)
+# =============================================================================
 @app.get("/estados-dia")
 def estados_del_dia(
     camion: str,
@@ -716,9 +742,9 @@ def estados_del_dia(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# -----------------------------------------------------------------------------
-# Limpieza / utilidades / migraciones simples
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Limpieza / utilidades / migraciones
+# =============================================================================
 @app.post("/limpiar-tablas")
 def limpiar_tablas():
     try:
@@ -743,10 +769,7 @@ def drop_redistribucion():
 
 @app.post("/admin/migrar-entregas-app")
 def migrar_entregas_app():
-    """
-    Agrega columnas faltantes a entregas_app (idempotente).
-    Ejecuta esto una sola vez si tu tabla es antigua.
-    """
+    """Agrega columnas faltantes a entregas_app (idempotente)."""
     try:
         with get_conn_cursor() as (_, cur):
             cur.execute("""
@@ -776,9 +799,9 @@ def migrar_entregas_app():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# -----------------------------------------------------------------------------
-# ✅ Endpoint público para sincronizar Excel del mapa
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Sync Excel del mapa
+# =============================================================================
 @app.post("/admin/sync-mapa")
 def sync_mapa():
     try:
