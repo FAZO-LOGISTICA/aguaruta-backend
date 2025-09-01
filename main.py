@@ -1,4 +1,3 @@
-# backend/main.py
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -24,21 +23,19 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise ValueError("❌ DATABASE_URL no está configurada en variables de entorno")
 
-# Forzar sslmode=require y connect_timeout si no vienen
 def _augment_dsn(url: str) -> str:
     out = url
     if "sslmode=" not in out:
         out += ("&sslmode=require" if "?" in out else "?sslmode=require")
     if "connect_timeout=" not in out:
         out += ("&connect_timeout=5" if "?" in out else "?connect_timeout=5")
-    # Etiqueta útil en PG para ver quién se conecta
     if "application_name=" not in out:
         out += ("&application_name=aguaruta-api" if "?" in out else "?application_name=aguaruta-api")
     return out
 
 DATABASE_URL = _augment_dsn(DATABASE_URL)
 
-app = FastAPI(title="AguaRuta API", version="3.2.2")
+app = FastAPI(title="AguaRuta API", version="3.2.3")
 
 # CORS (Netlify + local dev) — evita "*" con credentials
 app.add_middleware(
@@ -47,7 +44,7 @@ app.add_middleware(
         "https://aguaruta.netlify.app",
         "http://localhost:3000",
         "http://localhost:5173",
-        # "http://localhost:19006",  # descomenta si usas Expo Web
+        # "http://localhost:19006",  # descomentar si usas Expo Web
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -75,7 +72,7 @@ def _init_pool_with_retries(max_attempts: int = 6) -> None:
                 keepalives_interval=10,
                 keepalives_count=5,
             )
-            # Smoke test para asegurar handshake OK
+            # Smoke test
             conn = _pool.getconn()
             try:
                 with conn.cursor() as cur:
@@ -86,19 +83,14 @@ def _init_pool_with_retries(max_attempts: int = 6) -> None:
             return
         except Exception as e:
             last_err = e
-            # pequeño backoff: 1,2,4,8,10,10
-            sleep_s = min(10, 2 ** attempt)
-            time.sleep(sleep_s)
-    # Si no se pudo, dejamos _pool en None y levantamos la última excepción
-    raise last_err  # será manejada por quien llame
+            time.sleep(min(10, 2 ** attempt))  # 1,2,4,8,10,10
+    raise last_err
 
 @app.on_event("startup")
 def _startup_try_pool():
-    # Intentar crear pool al arrancar, pero sin botar el servicio si falla
     try:
         _init_pool_with_retries(max_attempts=3)
     except Exception as e:
-        # Log suave; los endpoints intentarán de nuevo al primer uso.
         print(f"[WARN] No se pudo inicializar el pool en startup: {e}")
 
 # -----------------------------------------------------------------------------
@@ -113,8 +105,6 @@ def _safe_ext(filename: str) -> str:
     return ext if ext in {"jpg", "jpeg", "png", "webp"} else "jpg"
 
 def _save_upload_file(f: UploadFile, subdir: str = "evidencias") -> str:
-    """Guarda UploadFile en /uploads/<subdir>/YYYY/MM/ y retorna ruta web '/uploads/...'.
-    """
     today = dt.datetime.now()
     folder = UPLOAD_ROOT / subdir / f"{today:%Y}" / f"{today:%m}"
     folder.mkdir(parents=True, exist_ok=True)
@@ -123,7 +113,7 @@ def _save_upload_file(f: UploadFile, subdir: str = "evidencias") -> str:
     disk_path = folder / name
     with open(disk_path, "wb") as out:
         out.write(f.file.read())
-    rel = disk_path.relative_to(UPLOAD_ROOT).as_posix()  # ruta pública
+    rel = disk_path.relative_to(UPLOAD_ROOT).as_posix()
     return f"/uploads/{rel}"
 
 # -----------------------------------------------------------------------------
@@ -135,7 +125,6 @@ def _get_pool_or_503() -> SimpleConnectionPool:
         try:
             _init_pool_with_retries(max_attempts=6)
         except Exception as e:
-            # No botamos el proceso; reportamos 503 al cliente
             raise HTTPException(status_code=503, detail=f"Base de datos no disponible: {e}")
     return _pool
 
@@ -194,7 +183,6 @@ def _haversine_km(lat1, lon1, lat2, lon2) -> float:
     return R * c
 
 def _today_str_tzcl():
-    # Fecha de Chile (maneja DST)
     return dt.datetime.now(ZoneInfo("America/Santiago")).date().isoformat()
 
 def _get_first(data: Dict, *keys, cast="float"):
@@ -207,13 +195,9 @@ def _get_first(data: Dict, *keys, cast="float"):
 # Rutas/paths de datos (Excel oficial del mapa)
 # -----------------------------------------------------------------------------
 DATA_DIR = Path("data"); DATA_DIR.mkdir(parents=True, exist_ok=True)
-MAP_XLSX = DATA_DIR / "base_datos_todos_con_coordenadas.xlsx"  # nombre oficial
+MAP_XLSX = DATA_DIR / "base_datos_todos_con_coordenadas.xlsx"
 
 def _sync_mapa_internal() -> Dict:
-    """
-    Toma puntos desde ruta_activa (solo con coordenadas válidas) y
-    escribe/actualiza el Excel oficial del mapa.
-    """
     with get_conn_cursor() as (_, cur):
         cur.execute("""
             SELECT nombre, litros, telefono, latitud, longitud
@@ -246,7 +230,6 @@ try:
     from routers.cloudinary import router as cloudinary_router
     app.include_router(cloudinary_router)
 except Exception:
-    # Si no existe el archivo, no rompemos el servidor
     pass
 
 # -----------------------------------------------------------------------------
@@ -260,7 +243,6 @@ def health():
 def healthz():
     return {"ok": True}
 
-# Ping real a la DB
 @app.get("/db/ping")
 def db_ping():
     try:
@@ -269,7 +251,6 @@ def db_ping():
             cur.fetchone()
         return {"ok": True}
     except HTTPException as he:
-        # Propaga 503 con el texto amigable
         raise he
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -325,7 +306,6 @@ def editar_ruta_activa(id: int, data: Dict):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# Compat:
 @app.put("/editar-ruta")
 def editar_ruta_legacy(payload: Dict):
     try:
@@ -702,11 +682,6 @@ def estados_del_dia(
     dia: Optional[str] = None,
     fecha: Optional[str] = None,
 ):
-    """
-    Devuelve [{id, estado}] donde 'id' es el id en ruta_activa y 'estado' es 1|0|2|3.
-    Calcula el último estado del día (fecha::date) para cada (camion,nombre) y lo mapea a la ruta activa.
-    Si 'dia' se envía, solo mapea sobre las rutas de ese día.
-    """
     try:
         fecha_d = fecha or _today_str_tzcl()
         with get_conn_cursor() as (_, cur):
@@ -799,7 +774,7 @@ def migrar_entregas_app():
             """)
         return {"ok": True, "mensaje": "✅ Migración aplicada (entregas_app)"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail:str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 # -----------------------------------------------------------------------------
 # ✅ Endpoint público para sincronizar Excel del mapa
