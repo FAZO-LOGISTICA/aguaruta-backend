@@ -1,11 +1,9 @@
 # main.py
-# Backend FastAPI – AguaRuta (consolidado y robusto)
+# Backend FastAPI – AguaRuta (contrato estable)
 # - Pool PostgreSQL con SSL (Render/Neon)
 # - CORS para Netlify/localhost
-# - /url.txt servido desde archivo local
-# - Evidencias en /fotos/evidencias/YYYY/MM
-# - Carga opcional de routers externos
-# - FALLBACK /rutas-activas tolerante a nombres de columnas/tabla
+# - /rutas-activas LEE DIRECTO de public.ruta_activa (sin detecciones)
+# - /entregas-app guarda evidencia en /fotos/evidencias/YYYY/MM y registra en DB
 
 import os
 import uuid
@@ -13,7 +11,7 @@ import shutil
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, List, Set
+from typing import Optional
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -109,7 +107,7 @@ app.mount("/fotos", StaticFiles(directory=str(BASE_DIR / "fotos")), name="fotos"
 def root():
     return f"{APP_NAME} OK"
 
-# Algunos health-checkers hacen HEAD /; devolvemos 200 vacío.
+# algunos health-checkers hacen HEAD /
 @app.head("/", include_in_schema=False)
 def head_root():
     return PlainTextResponse("")
@@ -142,63 +140,40 @@ def url_txt():
     return fp.read_text(encoding="utf-8").strip()
 
 # =============================================================================
-# Carga opcional de routers externos
+# ENDPOINTS DE NEGOCIO (CONTRATO ESTABLE)
 # =============================================================================
 
-def try_include_router(mod_path: str, attr: str = "router", prefix: str = "") -> bool:
+@app.get("/rutas-activas")
+def rutas_activas():
+    """
+    Devuelve rutas activas leyendo DIRECTO de public.ruta_activa.
+    Contrato: [{camion, nombre, dia, litros, telefono, latitud, longitud}]
+    """
+    if pool is None:
+        raise HTTPException(status_code=503, detail="DB no configurada")
+    conn = get_conn()
     try:
-        module = __import__(mod_path, fromlist=[attr])
-        router = getattr(module, attr)
-        app.include_router(router, prefix=prefix)
-        log.info(f"Router '{mod_path}' cargado")
-        return True
-    except Exception as e:
-        log.warning(f"No se pudo cargar router {mod_path}: {e}")
-        return False
-
-loaded_rutas = try_include_router("enrutadores.rutas_activas")   # /rutas-activas
-loaded_entregas = try_include_router("enrutadores.entregas")     # /entregas-app
-_ = try_include_router("enrutadores.redistribucion")             # opcional
-
-# =============================================================================
-# Utils SQL (para fallbacks)
-# =============================================================================
-
-def table_exists(cur, name: str) -> bool:
-    cur.execute(
-        """
-        SELECT 1
-        FROM information_schema.tables
-        WHERE table_schema='public' AND table_name=%s
-        """,
-        (name,),
-    )
-    return cur.fetchone() is not None
-
-def existing_columns(cur, table: str) -> Set[str]:
-    cur.execute(
-        """
-        SELECT column_name
-        FROM information_schema.columns
-        WHERE table_schema='public' AND table_name=%s
-        """,
-        (table,),
-    )
-    return {r[0] for r in cur.fetchall()}
-
-def pick_col(cols: Set[str], candidates: List[str]) -> Optional[str]:
-    for c in candidates:
-        if c in cols:
-            return c
-    return None
-
-# =============================================================================
-# FALLBACKS (si no existen routers)
-# =============================================================================
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    camion,
+                    nombre,
+                    dia,
+                    litros,
+                    telefono,
+                    latitud,
+                    longitud
+                FROM public.ruta_activa
+                ORDER BY camion, nombre;
+            """)
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, r)) for r in cur.fetchall()]
+    finally:
+        put_conn(conn)
 
 def ensure_table_entregas_app(conn) -> None:
     sql = """
-    CREATE TABLE IF NOT EXISTS entregas_app (
+    CREATE TABLE IF NOT EXISTS public.entregas_app (
         id UUID PRIMARY KEY,
         nombre TEXT,
         camion TEXT,
@@ -212,125 +187,74 @@ def ensure_table_entregas_app(conn) -> None:
     """
     with conn.cursor() as cur:
         cur.execute(sql)
+    conn.commit()
+
+@app.post("/entregas-app")
+async def entregas_app(
+    nombre: str = Form(...),
+    camion: str = Form(...),
+    litros: str = Form(...),
+    estado: int = Form(...),        # 1=entregada; 0/2=con foto; 3=sin foto por no ubicar
+    fecha: str = Form(...),         # "YYYY-MM-DD" o ISO
+    lat: Optional[float] = Form(None),
+    lon: Optional[float] = Form(None),
+    foto: Optional[UploadFile] = File(None),
+):
+    """
+    Guarda entrega + evidencia (si viene foto) y registra en Postgres.
+    Devuelve: {ok, id, foto_url?}
+    """
+    if pool is None:
+        raise HTTPException(status_code=503, detail="DB no configurada")
+
+    # Normaliza litros
+    try:
+        litros_int = int(float(litros))
+    except Exception:
+        litros_int = None
+
+    # Normaliza fecha
+    try:
+        if len(fecha) <= 10:
+            dt = datetime.strptime(fecha, "%Y-%m-%d")
+        else:
+            dt = datetime.fromisoformat(fecha.replace("Z", "+00:00"))
+    except Exception:
+        dt = datetime.utcnow()
+
+    # Guardar foto si existe
+    foto_rel = None
+    if foto is not None:
+        if not str(foto.content_type).lower().startswith("image/"):
+            raise HTTPException(status_code=400, detail="Archivo de foto inválido")
+        y = dt.year
+        m = f"{dt.month:02d}"
+        destino = FOTOS_DIR / str(y) / m
+        destino.mkdir(parents=True, exist_ok=True)
+        fname = f"evidencia_{uuid.uuid4().hex}.jpg"
+        fpath = destino / fname
+        with open(fpath, "wb") as out:
+            shutil.copyfileobj(foto.file, out)
+        foto_rel = f"/fotos/evidencias/{y}/{m}/{fname}"
+
+    # Insert en DB
+    conn = get_conn()
+    try:
+        ensure_table_entregas_app(conn)
+        with conn.cursor() as cur:
+            rec_id = str(uuid.uuid4())
+            cur.execute(
+                """
+                INSERT INTO public.entregas_app
+                (id, nombre, camion, litros, estado, fecha, lat, lon, foto_ruta)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """,
+                (rec_id, nombre, camion, litros_int, estado, dt, lat, lon, foto_rel),
+            )
         conn.commit()
-
-if not loaded_rutas:
-    @app.get("/rutas-activas")
-    def rutas_activas():
-        """
-        Respaldo /rutas-activas tolerante:
-        - Tabla: intenta 'rutas_activas' luego 'ruta_activa'.
-        - Columnas: usa la primera que exista entre los candidatos.
-        """
-        if pool is None:
-            raise HTTPException(status_code=503, detail="DB no configurada")
-        conn = get_conn()
-        try:
-            with conn.cursor() as cur:
-                # 1) Detecta tabla
-                table = None
-                for t in ("rutas_activas", "ruta_activa"):
-                    if table_exists(cur, t):
-                        table = t
-                        break
-                if not table:
-                    raise HTTPException(status_code=500, detail="No existe tabla rutas_activas/ruta_activa")
-
-                # 2) Detecta columnas
-                cols = existing_columns(cur, table)
-
-                camion_col   = pick_col(cols, ["camion", "id_camion"])
-                nombre_col   = pick_col(cols, ["nombre", "jefe_hogar", "vecino"])
-                dia_col      = pick_col(cols, ["dia_asignado", "dia"])
-                litros_col   = pick_col(cols, ["litros_entrega", "litros"])
-                telefono_col = pick_col(cols, ["telefono", "tel"])
-                lat_col      = pick_col(cols, ["latitud", "lat"])
-                lon_col      = pick_col(cols, ["longitud", "lon", "lng"])
-
-                # columnas mínimas necesarias
-                if not all([camion_col, nombre_col, dia_col, litros_col, lat_col, lon_col]):
-                    raise HTTPException(status_code=500, detail=f"Faltan columnas mínimas en {table}")
-
-                select_parts = [
-                    f"{camion_col}   AS camion",
-                    f"{nombre_col}   AS nombre",
-                    f"{dia_col}      AS dia",
-                    f"{litros_col}   AS litros",
-                    (f"{telefono_col} AS telefono" if telefono_col else "NULL::text AS telefono"),
-                    f"{lat_col}      AS latitud",
-                    f"{lon_col}      AS longitud",
-                ]
-                q = f"SELECT {', '.join(select_parts)} FROM {table} ORDER BY {camion_col}, {nombre_col};"
-                cur.execute(q)
-                rows = cur.fetchall()
-                hdrs = [d[0] for d in cur.description]
-                return [dict(zip(hdrs, r)) for r in rows]
-        finally:
-            put_conn(conn)
-
-if not loaded_entregas:
-    @app.post("/entregas-app")
-    async def entregas_app(
-        nombre: str = Form(...),
-        camion: str = Form(...),
-        litros: str = Form(...),
-        estado: int = Form(...),        # 1=entregada; 0/2=con foto; 3=sin foto por no ubicar
-        fecha: str = Form(...),         # "YYYY-MM-DD" o ISO
-        lat: Optional[float] = Form(None),
-        lon: Optional[float] = Form(None),
-        foto: Optional[UploadFile] = File(None),
-    ):
-        if pool is None:
-            raise HTTPException(status_code=503, detail="DB no configurada")
-
-        # Normaliza litros
-        try:
-            litros_int = int(float(litros))
-        except Exception:
-            litros_int = None
-
-        # Normaliza fecha
-        try:
-            if len(fecha) <= 10:
-                dt = datetime.strptime(fecha, "%Y-%m-%d")
-            else:
-                dt = datetime.fromisoformat(fecha.replace("Z", "+00:00"))
-        except Exception:
-            dt = datetime.utcnow()
-
-        # Guardar foto si viene adjunta
-        foto_rel = None
-        if foto is not None:
-            if not str(foto.content_type).lower().startswith("image/"):
-                raise HTTPException(status_code=400, detail="Archivo de foto inválido")
-            y = dt.year
-            m = f"{dt.month:02d}"
-            destino = FOTOS_DIR / str(y) / m
-            destino.mkdir(parents=True, exist_ok=True)
-            fname = f"evidencia_{uuid.uuid4().hex}.jpg"
-            fpath = destino / fname
-            with open(fpath, "wb") as out:
-                shutil.copyfileobj(foto.file, out)
-            foto_rel = f"/fotos/evidencias/{y}/{m}/{fname}"
-
-        # Insert en DB
-        conn = get_conn()
-        try:
-            ensure_table_entregas_app(conn)
-            with conn.cursor() as cur:
-                rec_id = str(uuid.uuid4())
-                cur.execute(
-                    """
-                    INSERT INTO entregas_app
-                    (id, nombre, camion, litros, estado, fecha, lat, lon, foto_ruta)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    """,
-                    (rec_id, nombre, camion, litros_int, estado, dt, lat, lon, foto_rel),
-                )
-                conn.commit()
-            return {"ok": True, "id": rec_id, "foto_url": foto_rel}
-        finally:
-            put_conn(conn)
+        return {"ok": True, "id": rec_id, "foto_url": foto_rel}
+    finally:
+        put_conn(conn)
 
 # =============================================================================
 # STARTUP / SHUTDOWN
