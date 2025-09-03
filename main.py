@@ -1,41 +1,36 @@
 # principal.py
-# Backend FastAPI – AguaRuta (versión consolidada)
-# - Pool PostgreSQL con SSL
-# - CORS para web/app
+# Backend FastAPI – AguaRuta (versión consolidada y robusta)
+# - Pool PostgreSQL con SSL (Render/Neon)
+# - CORS para Netlify/localhost
 # - /url.txt servido desde archivo local
 # - Evidencias en /fotos/evidencias/YYYY/MM
-# - Rutas mínimas de respaldo si no existen routers externos
+# - Fallbacks si no existen routers externos
+# - /rutas-activas tolerante a nombres de columnas/tabla
 
 import os
-import io
-import sys
-import json
 import uuid
-import math
-import time
 import shutil
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse, StreamingResponse, JSONResponse
+from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 import psycopg2
 from psycopg2.pool import SimpleConnectionPool
 
 # =============================================================================
-# CONFIGURACIÓN GENERAL
+# CONFIG
 # =============================================================================
 
 APP_NAME = "AguaRuta Backend"
 BASE_DIR = Path(__file__).resolve().parent
 FOTOS_DIR = BASE_DIR / "fotos" / "evidencias"
 
-# Logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -43,7 +38,7 @@ logging.basicConfig(
 log = logging.getLogger("aguaruta")
 
 # -----------------------------------------------------------------------------
-# DB: URL + Pool con SSL
+# DB URL + Pool con SSL
 # -----------------------------------------------------------------------------
 DB_URL = (
     os.getenv("DATABASE_URL")
@@ -52,26 +47,22 @@ DB_URL = (
 )
 
 if not DB_URL:
-    log.warning("⚠️ Falta DATABASE_URL/DB_URL en variables de entorno. "
-                "Se cargarán rutas de respaldo si aplican.")
+    log.warning("⚠️ Falta DATABASE_URL/DB_URL/POSTGRES_URL en variables de entorno.")
 else:
-    # Forzar sslmode=require si no está presente (evita errores en Render/Neon)
     if "sslmode=" not in DB_URL:
-        sep = "&" if ("?" in DB_URL) else "?"
-        DB_URL = f"{DB_URL}{sep}sslmode=require"
+        DB_URL += ("&" if "?" in DB_URL else "?") + "sslmode=require"
+
+POOL_MIN = int(os.getenv("PG_POOL_MIN", "1"))
+POOL_MAX = int(os.getenv("PG_POOL_MAX", "3"))
 
 pool: Optional[SimpleConnectionPool] = None
 
 def init_pool():
     global pool
-    if DB_URL and (pool is None):
-        log.info("Inicializando pool de conexiones…")
-        pool = SimpleConnectionPool(
-            minconn=1,
-            maxconn=int(os.getenv("DB_MAX_CONN", "8")),
-            dsn=DB_URL
-        )
-        log.info("Pool de conexiones listo.")
+    if DB_URL and pool is None:
+        log.info(f"Inicializando pool (min={POOL_MIN}, max={POOL_MAX})…")
+        pool = SimpleConnectionPool(POOL_MIN, POOL_MAX, DB_URL)
+        log.info("Pool listo.")
 
 def get_conn():
     if pool is None:
@@ -85,23 +76,18 @@ def put_conn(conn):
         pool.putconn(conn)
 
 # =============================================================================
-# FASTAPI APP
+# APP
 # =============================================================================
 
 app = FastAPI(title=APP_NAME)
 
-# CORS (Netlify, Expo y genérico)
+# CORS
 allow_origins = [
     os.getenv("FRONTEND_ORIGIN", "https://aguaruta.netlify.app"),
     "http://localhost",
     "http://localhost:3000",
     "http://localhost:5173",
-    # Expo Go / Metro typical origins (no siempre aplican a CORS, pero no estorban)
-    "exp://localhost",
-    "http://192.168.0.0/16",
-    "*",
 ]
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allow_origins,
@@ -112,8 +98,7 @@ app.add_middleware(
 
 # Estáticos para evidencias
 FOTOS_DIR.mkdir(parents=True, exist_ok=True)
-if not any(m.path == "/fotos" for m in app.router.routes if hasattr(m, "path")):
-    app.mount("/fotos", StaticFiles(directory=str(BASE_DIR / "fotos")), name="fotos")
+app.mount("/fotos", StaticFiles(directory=str(BASE_DIR / "fotos")), name="fotos")
 
 # =============================================================================
 # SALUD
@@ -123,22 +108,35 @@ if not any(m.path == "/fotos" for m in app.router.routes if hasattr(m, "path")):
 def root():
     return f"{APP_NAME} OK"
 
+@app.get("/health")
+def health():
+    try:
+        if DB_URL:
+            conn = get_conn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1;")
+                    cur.fetchone()
+            finally:
+                put_conn(conn)
+        return {"ok": True}
+    except Exception as e:
+        log.exception("Health check failed")
+        return {"ok": False, "error": str(e)}
+
 # =============================================================================
-# /url.txt  (descubrimiento de URL del backend para la app móvil)
+# /url.txt  (descubrimiento para app móvil)
 # =============================================================================
 
 @app.get("/url.txt", response_class=PlainTextResponse)
 def url_txt():
-    """
-    Devuelve el contenido del archivo url.txt (una sola línea con la URL pública actual).
-    """
     fp = BASE_DIR / "url.txt"
     if not fp.exists():
         raise HTTPException(status_code=404, detail="url.txt no existe")
     return fp.read_text(encoding="utf-8").strip()
 
 # =============================================================================
-# Carga opcional de routers externos si existen
+# Carga opcional de routers externos
 # =============================================================================
 
 def try_include_router(mod_path: str, attr: str = "router", prefix: str = ""):
@@ -152,9 +150,41 @@ def try_include_router(mod_path: str, attr: str = "router", prefix: str = ""):
         log.warning(f"No se pudo cargar router {mod_path}: {e}")
         return False
 
-loaded_rutas = try_include_router("enrutadores.rutas_activas")  # expone /rutas-activas
-loaded_entregas = try_include_router("enrutadores.entregas")    # expone /entregas-app
-_ = try_include_router("enrutadores.redistribucion")            # opcional
+loaded_rutas = try_include_router("enrutadores.rutas_activas")   # /rutas-activas
+loaded_entregas = try_include_router("enrutadores.entregas")     # /entregas-app
+_ = try_include_router("enrutadores.redistribucion")             # opcional
+
+# =============================================================================
+# Utilidades SQL para fallback
+# =============================================================================
+
+def table_exists(cur, name: str) -> bool:
+    cur.execute(
+        """
+        SELECT 1
+        FROM information_schema.tables
+        WHERE table_schema='public' AND table_name=%s
+        """,
+        (name,),
+    )
+    return cur.fetchone() is not None
+
+def existing_columns(cur, table: str) -> set:
+    cur.execute(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema='public' AND table_name=%s
+        """,
+        (table,),
+    )
+    return {r[0] for r in cur.fetchall()}
+
+def pick_col(cols: set, candidates: List[str]) -> Optional[str]:
+    for c in candidates:
+        if c in cols:
+            return c
+    return None
 
 # =============================================================================
 # FALLBACKS (si no existen routers)
@@ -182,29 +212,54 @@ if not loaded_rutas:
     @app.get("/rutas-activas")
     def rutas_activas():
         """
-        Respaldo mínimo de /rutas-activas si no hay router:
-        SELECT camion, nombre, latitud, longitud, litros, dia_asignado AS dia, telefono FROM ruta_activa
+        Respaldo /rutas-activas tolerante a nombres de columnas y tabla:
+        - Tabla: busca primero 'rutas_activas' y si no, 'ruta_activa'.
+        - Columnas: usa la primera que exista entre varios candidatos.
         """
         if pool is None:
             raise HTTPException(status_code=503, detail="DB no configurada")
         conn = get_conn()
         try:
             with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT
-                        camion,
-                        nombre,
-                        latitud,
-                        longitud,
-                        litros,
-                        COALESCE(dia_asignado, dia) AS dia,
-                        telefono
-                    FROM ruta_activa
-                """)
+                # 1) Detecta tabla
+                table = None
+                for t in ("rutas_activas", "ruta_activa"):
+                    if table_exists(cur, t):
+                        table = t
+                        break
+                if not table:
+                    raise HTTPException(status_code=500, detail="No existe tabla rutas_activas/ruta_activa")
+
+                # 2) Detecta columnas disponibles
+                cols = existing_columns(cur, table)
+
+                camion_col   = pick_col(cols, ["camion", "id_camion"])
+                nombre_col   = pick_col(cols, ["nombre", "jefe_hogar", "vecino"])
+                dia_col      = pick_col(cols, ["dia_asignado", "dia"])
+                litros_col   = pick_col(cols, ["litros_entrega", "litros"])
+                telefono_col = pick_col(cols, ["telefono", "tel"])
+                lat_col      = pick_col(cols, ["latitud", "lat"])
+                lon_col      = pick_col(cols, ["longitud", "lon", "lng"])
+
+                if not camion_col or not nombre_col or not dia_col or not litros_col or not lat_col or not lon_col:
+                    raise HTTPException(status_code=500, detail=f"Faltan columnas mínimas en {table}")
+
+                # 3) Construye SELECT seguro
+                select_parts = [
+                    f"{camion_col}   AS camion",
+                    f"{nombre_col}   AS nombre",
+                    f"{dia_col}      AS dia",
+                    f"{litros_col}   AS litros",
+                    (f"{telefono_col} AS telefono" if telefono_col else "NULL::text AS telefono"),
+                    f"{lat_col}      AS latitud",
+                    f"{lon_col}      AS longitud",
+                ]
+                q = f"SELECT {', '.join(select_parts)} FROM {table} ORDER BY {camion_col}, {nombre_col};"
+
+                cur.execute(q)
                 rows = cur.fetchall()
-                cols = [d[0] for d in cur.description]
-            data = [dict(zip(cols, r)) for r in rows]
-            return data
+                hdrs = [d[0] for d in cur.description]
+                return [dict(zip(hdrs, r)) for r in rows]
         finally:
             put_conn(conn)
 
@@ -214,27 +269,23 @@ if not loaded_entregas:
         nombre: str = Form(...),
         camion: str = Form(...),
         litros: str = Form(...),
-        estado: int = Form(...),        # 1=entregada(sin foto), 0/2=con foto, 3=sin foto
+        estado: int = Form(...),        # 1=entregada; 0/2=con foto; 3=sin foto por no ubicar
         fecha: str = Form(...),         # "YYYY-MM-DD" o ISO
         lat: Optional[float] = Form(None),
         lon: Optional[float] = Form(None),
         foto: Optional[UploadFile] = File(None),
     ):
-        """
-        Guarda entrega + evidencia (si corresponde) y registra en Postgres.
-        Devuelve {ok, id, foto_url?}
-        """
         if pool is None:
             raise HTTPException(status_code=503, detail="DB no configurada")
 
-        # Normaliza litros/fecha
+        # Normaliza litros
         try:
             litros_int = int(float(litros))
         except Exception:
             litros_int = None
 
+        # Normaliza fecha
         try:
-            # Acepta fecha "YYYY-MM-DD" o ISO
             if len(fecha) <= 10:
                 dt = datetime.strptime(fecha, "%Y-%m-%d")
             else:
@@ -247,19 +298,14 @@ if not loaded_entregas:
         if foto is not None:
             if not str(foto.content_type).lower().startswith("image/"):
                 raise HTTPException(status_code=400, detail="Archivo de foto inválido")
-
             y = dt.year
             m = f"{dt.month:02d}"
             destino = FOTOS_DIR / str(y) / m
             destino.mkdir(parents=True, exist_ok=True)
             fname = f"evidencia_{uuid.uuid4().hex}.jpg"
             fpath = destino / fname
-
-            # Save to disk
             with open(fpath, "wb") as out:
                 shutil.copyfileobj(foto.file, out)
-
-            # URL pública (servimos /fotos/…)
             foto_rel = f"/fotos/evidencias/{y}/{m}/{fname}"
 
         # Insert en DB
@@ -302,8 +348,3 @@ def on_shutdown():
             log.info("Pool DB cerrado.")
     except Exception:
         pass
-
-# =============================================================================
-# UTIL: Export CSV/Excel (opcional) – placeholder si lo necesitas luego
-# =============================================================================
-# Aquí podrías mantener tus endpoints de exportación, limpieza, etc.
