@@ -1,11 +1,11 @@
-# principal.py
-# Backend FastAPI – AguaRuta (versión consolidada y robusta)
+# main.py
+# Backend FastAPI – AguaRuta (consolidado y robusto)
 # - Pool PostgreSQL con SSL (Render/Neon)
 # - CORS para Netlify/localhost
 # - /url.txt servido desde archivo local
 # - Evidencias en /fotos/evidencias/YYYY/MM
-# - Fallbacks si no existen routers externos
-# - /rutas-activas tolerante a nombres de columnas/tabla
+# - Carga opcional de routers externos
+# - FALLBACK /rutas-activas tolerante a nombres de columnas/tabla
 
 import os
 import uuid
@@ -13,7 +13,7 @@ import shutil
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Set
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -57,7 +57,8 @@ POOL_MAX = int(os.getenv("PG_POOL_MAX", "3"))
 
 pool: Optional[SimpleConnectionPool] = None
 
-def init_pool():
+def init_pool() -> None:
+    """Inicializa el pool si hay DB_URL."""
     global pool
     if DB_URL and pool is None:
         log.info(f"Inicializando pool (min={POOL_MIN}, max={POOL_MAX})…")
@@ -71,7 +72,7 @@ def get_conn():
         raise RuntimeError("No hay pool de conexiones DB.")
     return pool.getconn()
 
-def put_conn(conn):
+def put_conn(conn) -> None:
     if pool and conn:
         pool.putconn(conn)
 
@@ -108,6 +109,11 @@ app.mount("/fotos", StaticFiles(directory=str(BASE_DIR / "fotos")), name="fotos"
 def root():
     return f"{APP_NAME} OK"
 
+# Algunos health-checkers hacen HEAD /; devolvemos 200 vacío.
+@app.head("/", include_in_schema=False)
+def head_root():
+    return PlainTextResponse("")
+
 @app.get("/health")
 def health():
     try:
@@ -139,7 +145,7 @@ def url_txt():
 # Carga opcional de routers externos
 # =============================================================================
 
-def try_include_router(mod_path: str, attr: str = "router", prefix: str = ""):
+def try_include_router(mod_path: str, attr: str = "router", prefix: str = "") -> bool:
     try:
         module = __import__(mod_path, fromlist=[attr])
         router = getattr(module, attr)
@@ -155,7 +161,7 @@ loaded_entregas = try_include_router("enrutadores.entregas")     # /entregas-app
 _ = try_include_router("enrutadores.redistribucion")             # opcional
 
 # =============================================================================
-# Utilidades SQL para fallback
+# Utils SQL (para fallbacks)
 # =============================================================================
 
 def table_exists(cur, name: str) -> bool:
@@ -169,7 +175,7 @@ def table_exists(cur, name: str) -> bool:
     )
     return cur.fetchone() is not None
 
-def existing_columns(cur, table: str) -> set:
+def existing_columns(cur, table: str) -> Set[str]:
     cur.execute(
         """
         SELECT column_name
@@ -180,7 +186,7 @@ def existing_columns(cur, table: str) -> set:
     )
     return {r[0] for r in cur.fetchall()}
 
-def pick_col(cols: set, candidates: List[str]) -> Optional[str]:
+def pick_col(cols: Set[str], candidates: List[str]) -> Optional[str]:
     for c in candidates:
         if c in cols:
             return c
@@ -190,7 +196,7 @@ def pick_col(cols: set, candidates: List[str]) -> Optional[str]:
 # FALLBACKS (si no existen routers)
 # =============================================================================
 
-def ensure_table_entregas_app(conn):
+def ensure_table_entregas_app(conn) -> None:
     sql = """
     CREATE TABLE IF NOT EXISTS entregas_app (
         id UUID PRIMARY KEY,
@@ -212,9 +218,9 @@ if not loaded_rutas:
     @app.get("/rutas-activas")
     def rutas_activas():
         """
-        Respaldo /rutas-activas tolerante a nombres de columnas y tabla:
-        - Tabla: busca primero 'rutas_activas' y si no, 'ruta_activa'.
-        - Columnas: usa la primera que exista entre varios candidatos.
+        Respaldo /rutas-activas tolerante:
+        - Tabla: intenta 'rutas_activas' luego 'ruta_activa'.
+        - Columnas: usa la primera que exista entre los candidatos.
         """
         if pool is None:
             raise HTTPException(status_code=503, detail="DB no configurada")
@@ -230,7 +236,7 @@ if not loaded_rutas:
                 if not table:
                     raise HTTPException(status_code=500, detail="No existe tabla rutas_activas/ruta_activa")
 
-                # 2) Detecta columnas disponibles
+                # 2) Detecta columnas
                 cols = existing_columns(cur, table)
 
                 camion_col   = pick_col(cols, ["camion", "id_camion"])
@@ -241,10 +247,10 @@ if not loaded_rutas:
                 lat_col      = pick_col(cols, ["latitud", "lat"])
                 lon_col      = pick_col(cols, ["longitud", "lon", "lng"])
 
-                if not camion_col or not nombre_col or not dia_col or not litros_col or not lat_col or not lon_col:
+                # columnas mínimas necesarias
+                if not all([camion_col, nombre_col, dia_col, litros_col, lat_col, lon_col]):
                     raise HTTPException(status_code=500, detail=f"Faltan columnas mínimas en {table}")
 
-                # 3) Construye SELECT seguro
                 select_parts = [
                     f"{camion_col}   AS camion",
                     f"{nombre_col}   AS nombre",
@@ -255,7 +261,6 @@ if not loaded_rutas:
                     f"{lon_col}      AS longitud",
                 ]
                 q = f"SELECT {', '.join(select_parts)} FROM {table} ORDER BY {camion_col}, {nombre_col};"
-
                 cur.execute(q)
                 rows = cur.fetchall()
                 hdrs = [d[0] for d in cur.description]
