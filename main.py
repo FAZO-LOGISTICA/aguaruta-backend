@@ -151,7 +151,6 @@ def rutas_activas():
     finally:
         put_conn(conn)
 
-# --- PUT /rutas-activas/{id}  -------------------------------------------------
 class RutaActivaUpdate(BaseModel):
     camion: Optional[str] = None
     nombre: Optional[str] = None
@@ -189,7 +188,6 @@ def update_ruta_activa(rid: int, body: RutaActivaUpdate):
     finally:
         put_conn(conn)
 
-# --- DELETE /rutas-activas/{id}  ----------------------------------------------
 @app.delete("/rutas-activas/{rid}")
 def delete_ruta_activa(rid: int):
     if pool is None:
@@ -330,11 +328,29 @@ def ensure_table_nuevos_puntos(conn) -> None:
         cur.execute(sql)
     conn.commit()
 
+def ensure_table_ruta_activa(conn) -> None:
+    """Crea ruta_activa si no existe (seguro). Ajusta tipos si ya existe."""
+    sql = """
+    CREATE TABLE IF NOT EXISTS public.ruta_activa (
+        id SERIAL PRIMARY KEY,
+        camion TEXT,
+        nombre TEXT,
+        dia TEXT,
+        litros INTEGER,
+        telefono TEXT,
+        latitud DOUBLE PRECISION,
+        longitud DOUBLE PRECISION
+    );
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql)
+    conn.commit()
+
 def normalize_camion(code: Optional[str]) -> Optional[str]:
     if not code:
         return None
     t = str(code).upper().replace("-", "").replace(" ", "")
-    return t  # backend "real" puede validar más estricto si quieres
+    return t  # Validación simple; endurecer si quieres
 
 def nearest_assignment(conn, lat: float, lon: float) -> Optional[dict]:
     """
@@ -359,13 +375,10 @@ def nearest_assignment(conn, lat: float, lon: float) -> Optional[dict]:
         return {"camion": camion, "dia": dia}
 
 @app.post("/registrar-nuevo-punto-auto")
-def registrar_nuevo_punto_auto(body: PuntoNuevo = Body(...)):
+def registrar_nuevo_punto_auto(body: PuntoNuevo = Body(...), activar: bool = True):
     """
-    Registra un nuevo punto en public.nuevos_puntos y devuelve la asignación.
-    Reglas:
-      - Si viene camion_override => se usa ese camión (normalizado)
-      - Si no, copia camión/día del vecino más cercano de ruta_activa
-      - Si no hay vecinos, camión='A1' y día=body.dia (o None)
+    Registra en 'nuevos_puntos' y, si activar=True (default), también en 'ruta_activa'
+    para que el punto quede visible en Rutas Activas y en el Mapa.
     """
     if pool is None:
         raise HTTPException(status_code=503, detail="DB no configurada")
@@ -373,9 +386,11 @@ def registrar_nuevo_punto_auto(body: PuntoNuevo = Body(...)):
     conn = get_conn()
     try:
         ensure_table_nuevos_puntos(conn)
+        if activar:
+            ensure_table_ruta_activa(conn)
 
+        # --- calcular asignación ---
         asignacion = {"camion": None, "dia": None}
-
         override = normalize_camion(body.camion_override)
         if override:
             asignacion["camion"] = override
@@ -389,6 +404,7 @@ def registrar_nuevo_punto_auto(body: PuntoNuevo = Body(...)):
                 asignacion["camion"] = "A1"
                 asignacion["dia"] = body.dia
 
+        # --- insertar en nuevos_puntos ---
         rec_id = str(uuid.uuid4())
         with conn.cursor() as cur:
             cur.execute(
@@ -409,9 +425,108 @@ def registrar_nuevo_punto_auto(body: PuntoNuevo = Body(...)):
                     "manual",
                 ),
             )
+
+        # --- insertar en ruta_activa (para que se vea de inmediato) ---
+        ruta_id = None
+        if activar:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO public.ruta_activa
+                    (camion, nombre, dia, litros, telefono, latitud, longitud)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s)
+                    RETURNING id;
+                    """,
+                    (
+                        asignacion["camion"],
+                        body.nombre.strip(),
+                        asignacion["dia"],
+                        int(body.litros),
+                        (body.telefono or None),
+                        float(body.latitud),
+                        float(body.longitud),
+                    ),
+                )
+                ruta_id = cur.fetchone()[0]
+
         conn.commit()
 
-        return {"ok": True, "id": rec_id, "asignacion": asignacion}
+        return {
+            "ok": True,
+            "id": rec_id,
+            "ruta_activa_id": ruta_id,
+            "asignacion": asignacion
+        }
+    finally:
+        put_conn(conn)
+
+# =============================================================================
+# MAPA – Unificación de puntos (ruta_activa + nuevos_puntos)
+# =============================================================================
+def rows_to_dicts(cur):
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+@app.get("/puntos-mapa")
+@app.get("/mapa-puntos")
+@app.get("/puntos")
+@app.get("/rutas-mapa")
+def puntos_mapa():
+    """
+    Devuelve puntos para mapa: une ruta_activa + nuevos_puntos (mínimos campos).
+    El frontend puede estar apuntando a cualquiera de estos paths.
+    """
+    if pool is None:
+        raise HTTPException(status_code=503, detail="DB no configurada")
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT nombre, litros, telefono, latitud, longitud, camion, dia
+                FROM public.ruta_activa
+                WHERE latitud IS NOT NULL AND longitud IS NOT NULL
+            """)
+            a = rows_to_dicts(cur)
+
+            cur.execute("""
+                SELECT nombre, litros, telefono, latitud, longitud, camion, dia
+                FROM public.nuevos_puntos
+                WHERE latitud IS NOT NULL AND longitud IS NOT NULL
+            """)
+            b = rows_to_dicts(cur)
+
+        # Priorizar ruta_activa (si hay duplicados por nombre+coords)
+        seen = set((r["nombre"], r["latitud"], r["longitud"]) for r in a)
+        merged = a + [r for r in b if (r["nombre"], r["latitud"], r["longitud"]) not in seen]
+        return {"ok": True, "count": len(merged), "items": merged}
+    finally:
+        put_conn(conn)
+
+# =============================================================================
+# SINCRONIZACIÓN MASIVA (opcional)
+# =============================================================================
+@app.post("/sincronizar-nuevos-a-ruta-activa")
+def sync_nuevos_a_ruta_activa():
+    if pool is None:
+        raise HTTPException(status_code=503, detail="DB no configurada")
+    conn = get_conn()
+    try:
+        ensure_table_ruta_activa(conn)
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO public.ruta_activa (camion, nombre, dia, litros, telefono, latitud, longitud)
+                SELECT camion, nombre, dia, litros, telefono, latitud, longitud
+                FROM public.nuevos_puntos np
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM public.ruta_activa ra
+                    WHERE ra.nombre = np.nombre
+                      AND ra.latitud = np.latitud
+                      AND ra.longitud = np.longitud
+                );
+            """)
+            inserted = cur.rowcount
+        conn.commit()
+        return {"ok": True, "inserted": inserted}
     finally:
         put_conn(conn)
 
