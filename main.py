@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -123,7 +123,7 @@ def url_txt():
     return fp.read_text(encoding="utf-8").strip()
 
 # =============================================================================
-# ENDPOINTS NEGOCIO
+# ENDPOINTS NEGOCIO – RUTAS ACTIVAS
 # =============================================================================
 @app.get("/rutas-activas")
 def rutas_activas():
@@ -206,7 +206,9 @@ def delete_ruta_activa(rid: int):
     finally:
         put_conn(conn)
 
-# --- ENTREGAS APP --------------------------------------------------------------
+# =============================================================================
+# ENTREGAS APP (fotos de respaldo/no entrega)
+# =============================================================================
 def ensure_table_entregas_app(conn) -> None:
     sql = """
     CREATE TABLE IF NOT EXISTS public.entregas_app (
@@ -285,6 +287,131 @@ async def entregas_app(
             )
         conn.commit()
         return {"ok": True, "id": rec_id, "foto_url": foto_rel}
+    finally:
+        put_conn(conn)
+
+# =============================================================================
+# CATÁLOGOS / NUEVOS PUNTOS (para RegistrarNuevoPunto.js)
+# =============================================================================
+@app.get("/camiones")
+def listar_camiones(only_active: bool = True):
+    """
+    Devuelve el listado de camiones disponibles.
+    Si deseas, reemplaza por SELECT DISTINCT camion FROM public.ruta_activa ...
+    """
+    items = ["A1", "A2", "A3", "A4", "A5", "M1", "M2", "M3"]
+    return {"ok": True, "items": items}
+
+class PuntoNuevo(BaseModel):
+    nombre: str
+    litros: int
+    telefono: Optional[str] = None
+    latitud: float
+    longitud: float
+    dia: Optional[str] = None                # opcional; si no viene, copia del vecino
+    camion_override: Optional[str] = None    # opcional; fuerza camión
+
+def ensure_table_nuevos_puntos(conn) -> None:
+    sql = """
+    CREATE TABLE IF NOT EXISTS public.nuevos_puntos (
+        id UUID PRIMARY KEY,
+        nombre TEXT NOT NULL,
+        telefono TEXT,
+        litros INTEGER NOT NULL,
+        latitud DOUBLE PRECISION NOT NULL,
+        longitud DOUBLE PRECISION NOT NULL,
+        camion TEXT,
+        dia TEXT,
+        fuente TEXT DEFAULT 'manual',
+        created_at TIMESTAMP DEFAULT NOW()
+    );
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql)
+    conn.commit()
+
+def normalize_camion(code: Optional[str]) -> Optional[str]:
+    if not code:
+        return None
+    t = str(code).upper().replace("-", "").replace(" ", "")
+    return t  # backend "real" puede validar más estricto si quieres
+
+def nearest_assignment(conn, lat: float, lon: float) -> Optional[dict]:
+    """
+    Busca el punto más cercano en ruta_activa y devuelve {'camion','dia'}.
+    Usa distancia euclídea simple para elegir vecino.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT camion, dia, latitud, longitud
+            FROM public.ruta_activa
+            WHERE latitud IS NOT NULL AND longitud IS NOT NULL
+            ORDER BY ((latitud - %s)^2 + (longitud - %s)^2) ASC
+            LIMIT 1;
+            """,
+            (lat, lon),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        camion, dia, _nlat, _nlon = row
+        return {"camion": camion, "dia": dia}
+
+@app.post("/registrar-nuevo-punto-auto")
+def registrar_nuevo_punto_auto(body: PuntoNuevo = Body(...)):
+    """
+    Registra un nuevo punto en public.nuevos_puntos y devuelve la asignación.
+    Reglas:
+      - Si viene camion_override => se usa ese camión (normalizado)
+      - Si no, copia camión/día del vecino más cercano de ruta_activa
+      - Si no hay vecinos, camión='A1' y día=body.dia (o None)
+    """
+    if pool is None:
+        raise HTTPException(status_code=503, detail="DB no configurada")
+
+    conn = get_conn()
+    try:
+        ensure_table_nuevos_puntos(conn)
+
+        asignacion = {"camion": None, "dia": None}
+
+        override = normalize_camion(body.camion_override)
+        if override:
+            asignacion["camion"] = override
+            asignacion["dia"] = body.dia
+        else:
+            vecino = nearest_assignment(conn, body.latitud, body.longitud)
+            if vecino:
+                asignacion["camion"] = vecino.get("camion")
+                asignacion["dia"] = body.dia or vecino.get("dia")
+            else:
+                asignacion["camion"] = "A1"
+                asignacion["dia"] = body.dia
+
+        rec_id = str(uuid.uuid4())
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO public.nuevos_puntos
+                (id, nombre, telefono, litros, latitud, longitud, camion, dia, fuente)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s);
+                """,
+                (
+                    rec_id,
+                    body.nombre.strip(),
+                    (body.telefono or None),
+                    int(body.litros),
+                    float(body.latitud),
+                    float(body.longitud),
+                    asignacion["camion"],
+                    asignacion["dia"],
+                    "manual",
+                ),
+            )
+        conn.commit()
+
+        return {"ok": True, "id": rec_id, "asignacion": asignacion}
     finally:
         put_conn(conn)
 
