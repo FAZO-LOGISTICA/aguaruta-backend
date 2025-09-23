@@ -1,3 +1,4 @@
+# 🚀 Forzar redeploy Render (CORS abierto)
 # main.py
 # Backend FastAPI – AguaRuta (contrato estable)
 import os
