@@ -73,7 +73,7 @@ app.add_middleware(
     allow_headers=["*"],       # acepta todos los headers
 )
 
-# Preflight global (por si alguna ruta/exception se interpone)
+# Preflight global
 @app.options("/{rest_of_path:path}")
 def preflight_any(rest_of_path: str):
     return Response(status_code=204)
@@ -202,7 +202,7 @@ def delete_ruta_activa(rid: int):
         put_conn(conn)
 
 # =============================================================================
-# ENTREGAS APP (fotos de respaldo/no entrega)
+# ENTREGAS APP (fotos de respaldo/no entrega, desde móviles)
 # =============================================================================
 def ensure_table_entregas_app(conn) -> None:
     sql = """
@@ -227,8 +227,8 @@ async def entregas_app(
     nombre: str = Form(...),
     camion: str = Form(...),
     litros: str = Form(...),
-    estado: int = Form(...),        # 1=entregada; 0/2=con foto; 3=sin foto por no ubicar
-    fecha: str = Form(...),         # "YYYY-MM-DD" o ISO
+    estado: int = Form(...),
+    fecha: str = Form(...),
     lat: Optional[float] = Form(None),
     lon: Optional[float] = Form(None),
     foto: Optional[UploadFile] = File(None),
@@ -236,13 +236,11 @@ async def entregas_app(
     if pool is None:
         raise HTTPException(status_code=503, detail="DB no configurada")
 
-    # litros
     try:
         litros_int = int(float(litros))
     except Exception:
         litros_int = None
 
-    # fecha
     try:
         if len(fecha) <= 10:
             dt = datetime.strptime(fecha, "%Y-%m-%d")
@@ -251,7 +249,6 @@ async def entregas_app(
     except Exception:
         dt = datetime.utcnow()
 
-    # foto
     foto_rel = None
     if foto is not None:
         if not str(foto.content_type).lower().startswith("image/"):
@@ -266,7 +263,6 @@ async def entregas_app(
             shutil.copyfileobj(foto.file, out)
         foto_rel = f"/fotos/evidencias/{y}/{m}/{fname}"
 
-    # insert
     conn = get_conn()
     try:
         ensure_table_entregas_app(conn)
@@ -286,14 +282,73 @@ async def entregas_app(
         put_conn(conn)
 
 # =============================================================================
+# REGISTRAR ENTREGAS MANUAL (desde frontend web)
+# =============================================================================
+def ensure_table_registrar_entregas(conn) -> None:
+    sql = """
+    CREATE TABLE IF NOT EXISTS public.entregas_manual (
+        id UUID PRIMARY KEY,
+        nombre TEXT NOT NULL,
+        camion TEXT NOT NULL,
+        litros INTEGER NOT NULL,
+        fecha TIMESTAMP NOT NULL,
+        lat DOUBLE PRECISION,
+        lon DOUBLE PRECISION,
+        created_at TIMESTAMP DEFAULT NOW()
+    );
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql)
+    conn.commit()
+
+@app.post("/registrar-entregas")
+async def registrar_entregas(
+    nombre: str = Form(...),
+    camion: str = Form(...),
+    litros: str = Form(...),
+    fecha: str = Form(...),
+    lat: Optional[float] = Form(None),
+    lon: Optional[float] = Form(None),
+):
+    if pool is None:
+        raise HTTPException(status_code=503, detail="DB no configurada")
+
+    try:
+        litros_int = int(float(litros))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Litros inválidos")
+
+    try:
+        if len(fecha) <= 10:
+            dt = datetime.strptime(fecha, "%Y-%m-%d")
+        else:
+            dt = datetime.fromisoformat(fecha.replace("Z", "+00:00"))
+    except Exception:
+        dt = datetime.utcnow()
+
+    conn = get_conn()
+    try:
+        ensure_table_registrar_entregas(conn)
+        with conn.cursor() as cur:
+            rec_id = str(uuid.uuid4())
+            cur.execute(
+                """
+                INSERT INTO public.entregas_manual
+                (id, nombre, camion, litros, fecha, lat, lon)
+                VALUES (%s,%s,%s,%s,%s,%s,%s)
+                """,
+                (rec_id, nombre, camion, litros_int, dt, lat, lon),
+            )
+        conn.commit()
+        return {"ok": True, "id": rec_id}
+    finally:
+        put_conn(conn)
+
+# =============================================================================
 # CATÁLOGOS / NUEVOS PUNTOS (para RegistrarNuevoPunto.js)
 # =============================================================================
 @app.get("/camiones")
 def listar_camiones(only_active: bool = True):
-    """
-    Devuelve el listado de camiones disponibles.
-    Si deseas, reemplaza por SELECT DISTINCT camion FROM public.ruta_activa ...
-    """
     items = ["A1", "A2", "A3", "A4", "A5", "M1", "M2", "M3"]
     return {"ok": True, "items": items}
 
@@ -303,7 +358,5 @@ class PuntoNuevo(BaseModel):
     telefono: Optional[str] = None
     latitud: float
     longitud: float
-    dia: Optional[str] = None                # opcional; si no viene, copia del vecino
-    camion_override: Optional[str] = None    # opcional; fuerza camión
-
-# ... (resto de tu código de nuevos puntos, mapas, sync, startup/shutdown sigue igual) ...
+    dia: Optional[str] = None
+    camion_override: Optional[str] = None
