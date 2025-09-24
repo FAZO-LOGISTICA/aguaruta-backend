@@ -124,7 +124,6 @@ def url_txt():
 # =============================================================================
 @app.get("/rutas-activas")
 def rutas_activas():
-    """Lee DIRECTO from public.ruta_activa."""
     if pool is None:
         raise HTTPException(status_code=503, detail="DB no configurada")
     conn = get_conn()
@@ -161,11 +160,9 @@ class RutaActivaUpdate(BaseModel):
 def update_ruta_activa(rid: int, body: RutaActivaUpdate):
     if pool is None:
         raise HTTPException(status_code=503, detail="DB no configurada")
-
     updates: Dict[str, Any] = {k: v for k, v in body.dict().items() if v is not None}
     if not updates:
         return {"ok": True, "updated": 0, "id": rid}
-
     conn = get_conn()
     try:
         sets = []
@@ -202,7 +199,7 @@ def delete_ruta_activa(rid: int):
         put_conn(conn)
 
 # =============================================================================
-# ENTREGAS APP (fotos de respaldo/no entrega, desde móviles y web manual)
+# ENTREGAS APP (choferes)
 # =============================================================================
 def ensure_table_entregas_app(conn) -> None:
     sql = """
@@ -236,12 +233,10 @@ async def entregas_app(
 ):
     if pool is None:
         raise HTTPException(status_code=503, detail="DB no configurada")
-
     try:
         litros_int = int(float(litros))
     except Exception:
         litros_int = None
-
     try:
         if len(fecha) <= 10:
             dt = datetime.strptime(fecha, "%Y-%m-%d")
@@ -249,13 +244,11 @@ async def entregas_app(
             dt = datetime.fromisoformat(fecha.replace("Z", "+00:00"))
     except Exception:
         dt = datetime.utcnow()
-
     foto_rel = None
     if foto is not None:
         if not str(foto.content_type).lower().startswith("image/"):
             raise HTTPException(status_code=400, detail="Archivo de foto inválido")
-        y = dt.year
-        m = f"{dt.month:02d}"
+        y, m = dt.year, f"{dt.month:02d}"
         destino = FOTOS_DIR / str(y) / m
         destino.mkdir(parents=True, exist_ok=True)
         fname = f"evidencia_{uuid.uuid4().hex}.jpg"
@@ -263,7 +256,6 @@ async def entregas_app(
         with open(fpath, "wb") as out:
             shutil.copyfileobj(foto.file, out)
         foto_rel = f"/fotos/evidencias/{y}/{m}/{fname}"
-
     conn = get_conn()
     try:
         ensure_table_entregas_app(conn)
@@ -273,9 +265,9 @@ async def entregas_app(
                 """
                 INSERT INTO public.entregas_app
                 (id, nombre, camion, litros, estado, fecha, lat, lon, foto_ruta, fuente)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'app')
                 """,
-                (rec_id, nombre, camion, litros_int, estado, dt, lat, lon, foto_rel, "app"),
+                (rec_id, nombre, camion, litros_int, estado, dt, lat, lon, foto_rel),
             )
         conn.commit()
         return {"ok": True, "id": rec_id, "foto_url": foto_rel}
@@ -283,55 +275,64 @@ async def entregas_app(
         put_conn(conn)
 
 # =============================================================================
-# REGISTRAR ENTREGAS MANUAL (frontend web → también en entregas_app)
+# ENTREGAS MANUALES (RegistrarEntrega.js)
 # =============================================================================
+def ensure_table_entregas(conn) -> None:
+    sql = """
+    CREATE TABLE IF NOT EXISTS public.entregas (
+        id UUID PRIMARY KEY,
+        nombre TEXT,
+        camion TEXT,
+        litros INTEGER,
+        estado INTEGER,
+        fecha TIMESTAMP,
+        latitud DOUBLE PRECISION,
+        longitud DOUBLE PRECISION,
+        fuente TEXT DEFAULT 'manual'
+    );
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql)
+    conn.commit()
+
 @app.post("/registrar-entregas")
-async def registrar_entregas(
-    nombre: str = Form(...),
-    camion: str = Form(...),
-    litros: str = Form(...),
-    fecha: str = Form(...),
-    lat: Optional[float] = Form(None),
-    lon: Optional[float] = Form(None),
-):
+def registrar_entregas(body: Dict[str, Any] = Body(...)):
     if pool is None:
         raise HTTPException(status_code=503, detail="DB no configurada")
-
-    try:
-        litros_int = int(float(litros))
-    except Exception:
-        raise HTTPException(status_code=400, detail="Litros inválidos")
-
-    try:
-        if len(fecha) <= 10:
-            dt = datetime.strptime(fecha, "%Y-%m-%d")
-        else:
-            dt = datetime.fromisoformat(fecha.replace("Z", "+00:00"))
-    except Exception:
-        dt = datetime.utcnow()
-
     conn = get_conn()
     try:
-        ensure_table_entregas_app(conn)
+        ensure_table_entregas(conn)
+        rec_id = str(uuid.uuid4())
+        try:
+            litros_int = int(body.get("litros", 0))
+        except Exception:
+            litros_int = None
+        try:
+            fecha_str = body.get("fecha")
+            if fecha_str and len(fecha_str) <= 10:
+                dt = datetime.strptime(fecha_str, "%Y-%m-%d")
+            elif fecha_str:
+                dt = datetime.fromisoformat(fecha_str.replace("Z", "+00:00"))
+            else:
+                dt = datetime.utcnow()
+        except Exception:
+            dt = datetime.utcnow()
         with conn.cursor() as cur:
-            rec_id = str(uuid.uuid4())
             cur.execute(
                 """
-                INSERT INTO public.entregas_app
-                (id, nombre, camion, litros, estado, fecha, lat, lon, foto_ruta, fuente)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                INSERT INTO public.entregas
+                (id, nombre, camion, litros, estado, fecha, latitud, longitud, fuente)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'manual')
                 """,
                 (
                     rec_id,
-                    nombre,
-                    camion,
+                    body.get("nombre"),
+                    body.get("camion"),
                     litros_int,
-                    1,         # estado = entregada
+                    body.get("estado", 1),
                     dt,
-                    lat,
-                    lon,
-                    None,      # sin foto
-                    "manual",  # fuente manual
+                    body.get("latitud"),
+                    body.get("longitud"),
                 ),
             )
         conn.commit()
@@ -340,18 +341,45 @@ async def registrar_entregas(
         put_conn(conn)
 
 # =============================================================================
-# CATÁLOGOS / NUEVOS PUNTOS (para RegistrarNuevoPunto.js)
+# ENTREGAS – UNIFICADAS
 # =============================================================================
-@app.get("/camiones")
-def listar_camiones(only_active: bool = True):
-    items = ["A1", "A2", "A3", "A4", "A5", "M1", "M2", "M3"]
-    return {"ok": True, "items": items}
+@app.get("/entregas-todas")
+def entregas_todas():
+    if pool is None:
+        raise HTTPException(status_code=503, detail="DB no configurada")
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, nombre, camion, litros, estado, fecha, lat AS latitud, lon AS longitud, fuente
+                FROM public.entregas_app
+                UNION ALL
+                SELECT id, nombre, camion, litros, estado, fecha, latitud, longitud, fuente
+                FROM public.entregas
+                ORDER BY fecha DESC;
+            """)
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, r)) for r in cur.fetchall()]
+    finally:
+        put_conn(conn)
 
-class PuntoNuevo(BaseModel):
-    nombre: str
-    litros: int
-    telefono: Optional[str] = None
-    latitud: float
-    longitud: float
-    dia: Optional[str] = None
-    camion_override: Optional[str] = None
+# =============================================================================
+# START/STOP
+# =============================================================================
+@app.on_event("startup")
+def on_startup():
+    try:
+        init_pool()
+    except Exception as e:
+        log.warning(f"No se pudo inicializar pool DB al inicio: {e}")
+    log.info("Aplicación iniciada.")
+
+@app.on_event("shutdown")
+def on_shutdown():
+    global pool
+    try:
+        if pool:
+            pool.closeall()
+            log.info("Pool DB cerrado.")
+    except Exception:
+        pass
