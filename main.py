@@ -202,7 +202,7 @@ def delete_ruta_activa(rid: int):
         put_conn(conn)
 
 # =============================================================================
-# ENTREGAS APP (fotos de respaldo/no entrega, desde móviles)
+# ENTREGAS APP (fotos de respaldo/no entrega, desde móviles y web manual)
 # =============================================================================
 def ensure_table_entregas_app(conn) -> None:
     sql = """
@@ -215,7 +215,8 @@ def ensure_table_entregas_app(conn) -> None:
         fecha TIMESTAMP,
         lat DOUBLE PRECISION,
         lon DOUBLE PRECISION,
-        foto_ruta TEXT
+        foto_ruta TEXT,
+        fuente TEXT DEFAULT 'app'
     );
     """
     with conn.cursor() as cur:
@@ -271,10 +272,10 @@ async def entregas_app(
             cur.execute(
                 """
                 INSERT INTO public.entregas_app
-                (id, nombre, camion, litros, estado, fecha, lat, lon, foto_ruta)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                (id, nombre, camion, litros, estado, fecha, lat, lon, foto_ruta, fuente)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """,
-                (rec_id, nombre, camion, litros_int, estado, dt, lat, lon, foto_rel),
+                (rec_id, nombre, camion, litros_int, estado, dt, lat, lon, foto_rel, "app"),
             )
         conn.commit()
         return {"ok": True, "id": rec_id, "foto_url": foto_rel}
@@ -282,25 +283,8 @@ async def entregas_app(
         put_conn(conn)
 
 # =============================================================================
-# REGISTRAR ENTREGAS MANUAL (desde frontend web)
+# REGISTRAR ENTREGAS MANUAL (frontend web → también en entregas_app)
 # =============================================================================
-def ensure_table_registrar_entregas(conn) -> None:
-    sql = """
-    CREATE TABLE IF NOT EXISTS public.entregas_manual (
-        id UUID PRIMARY KEY,
-        nombre TEXT NOT NULL,
-        camion TEXT NOT NULL,
-        litros INTEGER NOT NULL,
-        fecha TIMESTAMP NOT NULL,
-        lat DOUBLE PRECISION,
-        lon DOUBLE PRECISION,
-        created_at TIMESTAMP DEFAULT NOW()
-    );
-    """
-    with conn.cursor() as cur:
-        cur.execute(sql)
-    conn.commit()
-
 @app.post("/registrar-entregas")
 async def registrar_entregas(
     nombre: str = Form(...),
@@ -328,16 +312,27 @@ async def registrar_entregas(
 
     conn = get_conn()
     try:
-        ensure_table_registrar_entregas(conn)
+        ensure_table_entregas_app(conn)
         with conn.cursor() as cur:
             rec_id = str(uuid.uuid4())
             cur.execute(
                 """
-                INSERT INTO public.entregas_manual
-                (id, nombre, camion, litros, fecha, lat, lon)
-                VALUES (%s,%s,%s,%s,%s,%s,%s)
+                INSERT INTO public.entregas_app
+                (id, nombre, camion, litros, estado, fecha, lat, lon, foto_ruta, fuente)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """,
-                (rec_id, nombre, camion, litros_int, dt, lat, lon),
+                (
+                    rec_id,
+                    nombre,
+                    camion,
+                    litros_int,
+                    1,         # estado = entregada
+                    dt,
+                    lat,
+                    lon,
+                    None,      # sin foto
+                    "manual",  # fuente manual
+                ),
             )
         conn.commit()
         return {"ok": True, "id": rec_id}
