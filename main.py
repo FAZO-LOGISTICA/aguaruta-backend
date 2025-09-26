@@ -129,6 +129,7 @@ def rutas_activas():
     conn = get_conn()
     try:
         with conn.cursor() as cur:
+            # ✅ usar la tabla correcta: rutas_activas
             cur.execute("""
                 SELECT
                     id,
@@ -136,10 +137,8 @@ def rutas_activas():
                     nombre,
                     dia,
                     litros,
-                    telefono,
-                    latitud,
-                    longitud
-                FROM public.ruta_activa
+                    activa
+                FROM public.rutas_activas
                 ORDER BY camion, nombre;
             """)
             cols = [d[0] for d in cur.description]
@@ -171,7 +170,7 @@ def update_ruta_activa(rid: int, body: RutaActivaUpdate):
             sets.append(f"{col} = %s")
             vals.append(val)
         vals.append(rid)
-        sql = f"UPDATE public.ruta_activa SET {', '.join(sets)} WHERE id = %s;"
+        sql = f"UPDATE public.rutas_activas SET {', '.join(sets)} WHERE id = %s;"
         with conn.cursor() as cur:
             cur.execute(sql, tuple(vals))
             updated = cur.rowcount
@@ -189,7 +188,7 @@ def delete_ruta_activa(rid: int):
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM public.ruta_activa WHERE id = %s;", (rid,))
+            cur.execute("DELETE FROM public.rutas_activas WHERE id = %s;", (rid,))
             deleted = cur.rowcount
         conn.commit()
         if deleted == 0:
