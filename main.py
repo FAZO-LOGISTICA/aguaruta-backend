@@ -68,7 +68,7 @@ app = FastAPI(title=APP_NAME)
 # 🚨 FIX: CORS abierto para pruebas (incluye Netlify)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],       # 🔥 abre todo (frontend Netlify incluido)
+    allow_origins=["*"],       # 🔥 abre todo
     allow_credentials=True,
     allow_methods=["*"],       # GET, POST, PUT, DELETE, OPTIONS
     allow_headers=["*"],       # acepta todos los headers
@@ -120,7 +120,6 @@ def url_txt():
 # RUTAS ACTIVAS
 # =============================================================================
 def ensure_table_rutas_activas(conn) -> None:
-    """Crea la tabla rutas_activas con todas las columnas si no existe."""
     sql = """
     CREATE TABLE IF NOT EXISTS public.rutas_activas (
         id SERIAL PRIMARY KEY,
@@ -147,16 +146,7 @@ def rutas_activas():
         ensure_table_rutas_activas(conn)
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT
-                    id,
-                    camion,
-                    nombre,
-                    dia,
-                    litros,
-                    telefono,
-                    latitud,
-                    longitud,
-                    activa
+                SELECT id, camion, nombre, dia, litros, telefono, latitud, longitud, activa
                 FROM public.rutas_activas
                 ORDER BY camion, nombre;
             """)
@@ -220,5 +210,187 @@ def delete_ruta_activa(rid: int):
         put_conn(conn)
 
 # =============================================================================
-# (lo demás: entregas_app, registrar_entregas, entregas_todas) se mantiene igual
+# ENTREGAS APP (choferes)
 # =============================================================================
+def ensure_table_entregas_app(conn) -> None:
+    sql = """
+    CREATE TABLE IF NOT EXISTS public.entregas_app (
+        id UUID PRIMARY KEY,
+        nombre TEXT,
+        camion TEXT,
+        litros INTEGER,
+        estado INTEGER,
+        fecha TIMESTAMP,
+        lat DOUBLE PRECISION,
+        lon DOUBLE PRECISION,
+        foto_ruta TEXT,
+        fuente TEXT DEFAULT 'app'
+    );
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql)
+    conn.commit()
+
+@app.post("/entregas-app")
+async def entregas_app(
+    nombre: str = Form(...),
+    camion: str = Form(...),
+    litros: str = Form(...),
+    estado: int = Form(...),
+    fecha: str = Form(...),
+    lat: Optional[float] = Form(None),
+    lon: Optional[float] = Form(None),
+    foto: Optional[UploadFile] = File(None),
+):
+    if pool is None:
+        raise HTTPException(status_code=503, detail="DB no configurada")
+    try:
+        litros_int = int(float(litros))
+    except Exception:
+        litros_int = None
+    try:
+        if len(fecha) <= 10:
+            dt = datetime.strptime(fecha, "%Y-%m-%d")
+        else:
+            dt = datetime.fromisoformat(fecha.replace("Z", "+00:00"))
+    except Exception:
+        dt = datetime.utcnow()
+    foto_rel = None
+    if foto is not None:
+        if not str(foto.content_type).lower().startswith("image/"):
+            raise HTTPException(status_code=400, detail="Archivo de foto inválido")
+        y, m = dt.year, f"{dt.month:02d}"
+        destino = FOTOS_DIR / str(y) / m
+        destino.mkdir(parents=True, exist_ok=True)
+        fname = f"evidencia_{uuid.uuid4().hex}.jpg"
+        fpath = destino / fname
+        with open(fpath, "wb") as out:
+            shutil.copyfileobj(foto.file, out)
+        foto_rel = f"/fotos/evidencias/{y}/{m}/{fname}"
+    conn = get_conn()
+    try:
+        ensure_table_entregas_app(conn)
+        with conn.cursor() as cur:
+            rec_id = str(uuid.uuid4())
+            cur.execute(
+                """
+                INSERT INTO public.entregas_app
+                (id, nombre, camion, litros, estado, fecha, lat, lon, foto_ruta, fuente)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'app')
+                """,
+                (rec_id, nombre, camion, litros_int, estado, dt, lat, lon, foto_rel),
+            )
+        conn.commit()
+        return {"ok": True, "id": rec_id, "foto_url": foto_rel}
+    finally:
+        put_conn(conn)
+
+# =============================================================================
+# ENTREGAS MANUALES (RegistrarEntrega.js)
+# =============================================================================
+def ensure_table_entregas(conn) -> None:
+    sql = """
+    CREATE TABLE IF NOT EXISTS public.entregas (
+        id UUID PRIMARY KEY,
+        nombre TEXT,
+        camion TEXT,
+        litros INTEGER,
+        estado INTEGER,
+        fecha TIMESTAMP,
+        latitud DOUBLE PRECISION,
+        longitud DOUBLE PRECISION,
+        fuente TEXT DEFAULT 'manual'
+    );
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql)
+    conn.commit()
+
+@app.post("/registrar-entregas")
+def registrar_entregas(body: Dict[str, Any] = Body(...)):
+    if pool is None:
+        raise HTTPException(status_code=503, detail="DB no configurada")
+    conn = get_conn()
+    try:
+        ensure_table_entregas(conn)
+        rec_id = str(uuid.uuid4())
+        try:
+            litros_int = int(body.get("litros", 0))
+        except Exception:
+            litros_int = None
+        try:
+            fecha_str = body.get("fecha")
+            if fecha_str and len(fecha_str) <= 10:
+                dt = datetime.strptime(fecha_str, "%Y-%m-%d")
+            elif fecha_str:
+                dt = datetime.fromisoformat(fecha_str.replace("Z", "+00:00"))
+            else:
+                dt = datetime.utcnow()
+        except Exception:
+            dt = datetime.utcnow()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO public.entregas
+                (id, nombre, camion, litros, estado, fecha, latitud, longitud, fuente)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'manual')
+                """,
+                (
+                    rec_id,
+                    body.get("nombre"),
+                    body.get("camion"),
+                    litros_int,
+                    body.get("estado", 1),
+                    dt,
+                    body.get("latitud"),
+                    body.get("longitud"),
+                ),
+            )
+        conn.commit()
+        return {"ok": True, "id": rec_id}
+    finally:
+        put_conn(conn)
+
+# =============================================================================
+# ENTREGAS – UNIFICADAS
+# =============================================================================
+@app.get("/entregas-todas")
+def entregas_todas():
+    if pool is None:
+        raise HTTPException(status_code=503, detail="DB no configurada")
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, nombre, camion, litros, estado, fecha, lat AS latitud, lon AS longitud, fuente
+                FROM public.entregas_app
+                UNION ALL
+                SELECT id, nombre, camion, litros, estado, fecha, latitud, longitud, fuente
+                FROM public.entregas
+                ORDER BY fecha DESC;
+            """)
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, r)) for r in cur.fetchall()]
+    finally:
+        put_conn(conn)
+
+# =============================================================================
+# START/STOP
+# =============================================================================
+@app.on_event("startup")
+def on_startup():
+    try:
+        init_pool()
+    except Exception as e:
+        log.warning(f"No se pudo inicializar pool DB al inicio: {e}")
+    log.info("Aplicación iniciada.")
+
+@app.on_event("shutdown")
+def on_shutdown():
+    global pool
+    try:
+        if pool:
+            pool.closeall()
+            log.info("Pool DB cerrado.")
+    except Exception:
+        pass
