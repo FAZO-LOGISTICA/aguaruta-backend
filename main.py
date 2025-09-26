@@ -129,7 +129,7 @@ def rutas_activas():
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-            # ✅ usar la tabla correcta: rutas_activas
+            # ✅ Incluye coordenadas para que el mapa funcione
             cur.execute("""
                 SELECT
                     id,
@@ -137,6 +137,9 @@ def rutas_activas():
                     nombre,
                     dia,
                     litros,
+                    telefono,
+                    latitud,
+                    longitud,
                     activa
                 FROM public.rutas_activas
                 ORDER BY camion, nombre;
@@ -154,6 +157,7 @@ class RutaActivaUpdate(BaseModel):
     telefono: Optional[str] = None
     latitud: Optional[float] = None
     longitud: Optional[float] = None
+    activa: Optional[bool] = None
 
 @app.put("/rutas-activas/{rid}")
 def update_ruta_activa(rid: int, body: RutaActivaUpdate):
