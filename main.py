@@ -64,21 +64,18 @@ def put_conn(conn) -> None:
 # =============================================================================
 app = FastAPI(title=APP_NAME)
 
-# 🚨 FIX: CORS abierto para pruebas (incluye Netlify)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],       # 🔥 abre todo (frontend Netlify incluido)
+    allow_origins=["*"],       # 🔥 abre todo (incluye Netlify)
     allow_credentials=True,
     allow_methods=["*"],       # GET, POST, PUT, DELETE, OPTIONS
-    allow_headers=["*"],       # acepta todos los headers
+    allow_headers=["*"],
 )
 
-# Preflight global
 @app.options("/{rest_of_path:path}")
 def preflight_any(rest_of_path: str):
     return Response(status_code=204)
 
-# Estáticos para evidencias
 FOTOS_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/fotos", StaticFiles(directory=str(BASE_DIR / "fotos")), name="fotos")
 
@@ -88,10 +85,6 @@ app.mount("/fotos", StaticFiles(directory=str(BASE_DIR / "fotos")), name="fotos"
 @app.get("/", response_class=PlainTextResponse)
 def root():
     return f"{APP_NAME} OK"
-
-@app.head("/", include_in_schema=False)
-def head_root():
-    return PlainTextResponse("")
 
 @app.get("/health")
 def health():
@@ -120,7 +113,7 @@ def url_txt():
     return fp.read_text(encoding="utf-8").strip()
 
 # =============================================================================
-# ENDPOINTS NEGOCIO – RUTAS ACTIVAS
+# RUTAS ACTIVAS
 # =============================================================================
 @app.get("/rutas-activas")
 def rutas_activas():
@@ -129,7 +122,6 @@ def rutas_activas():
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-            # ✅ Incluye coordenadas para que el mapa funcione
             cur.execute("""
                 SELECT
                     id,
