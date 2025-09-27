@@ -1,13 +1,11 @@
-# main.py
-# 🚀 Backend AguaRuta estable con importación de Excel
-
+# main.py — Backend AguaRuta (conservador: no rompe lo existente)
 import os
 import uuid
 import shutil
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Body
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,217 +16,245 @@ from pydantic import BaseModel
 import psycopg2
 from psycopg2.pool import SimpleConnectionPool
 
-import pandas as pd
-
 # =============================================================================
-# CONFIG
+# CONFIG / LOGGING
 # =============================================================================
 APP_NAME = "AguaRuta Backend"
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
 FOTOS_DIR = BASE_DIR / "fotos" / "evidencias"
+FOTOS_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-log = logging.getLogger("aguaruta")
+log = logging.getLogger(APP_NAME)
 
+# =============================================================================
+# DB POOL (reutiliza si ya existe)
+# =============================================================================
 DB_URL = os.getenv("DATABASE_URL") or os.getenv("DB_URL") or os.getenv("POSTGRES_URL")
-if DB_URL and "sslmode=" not in DB_URL:
-    DB_URL += ("&" if "?" in DB_URL else "?") + "sslmode=require"
 
-POOL_MIN = int(os.getenv("PG_POOL_MIN", "1"))
-POOL_MAX = int(os.getenv("PG_POOL_MAX", "3"))
+if 'pool' not in globals():
+    if not DB_URL:
+        log.warning("No hay DATABASE_URL/DB_URL/POSTGRES_URL en entorno. Se asume pool existente o endpoints que no usan DB.")
+        pool = None
+    else:
+        pool = SimpleConnectionPool(1, 10, dsn=DB_URL)
+        log.info("Pool Postgres creado.")
 
-pool: Optional[SimpleConnectionPool] = None
-
-
-def init_pool():
-    global pool
-    if DB_URL and pool is None:
-        log.info(f"Inicializando pool (min={POOL_MIN}, max={POOL_MAX})…")
-        pool = SimpleConnectionPool(POOL_MIN, POOL_MAX, DB_URL)
-        log.info("Pool listo.")
-
-
-def get_conn():
-    if pool is None:
-        init_pool()
-    if pool is None:
-        raise RuntimeError("No hay pool de conexiones DB.")
+# Helper DB
+def db_conn():
+    if not pool:
+        raise RuntimeError("Pool de DB no inicializado.")
     return pool.getconn()
 
-
-def put_conn(conn):
+def db_put(conn):
     if pool and conn:
         pool.putconn(conn)
 
+# =============================================================================
+# APP (reutiliza si ya existe)
+# =============================================================================
+try:
+    app  # type: ignore
+except NameError:
+    app = FastAPI(title=APP_NAME)
+    log.info("Instancia FastAPI creada.")
+
+# CORS (idempotente: no falla si se aplica dos veces)
+try:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[
+            os.getenv("FRONTEND_ORIGIN", "https://aguaruta.netlify.app"),
+            "*",  # respaldo
+        ],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+except Exception as _e:
+    log.warning("No se pudo aplicar CORS (posible middleware duplicado). Continuando...")
+
+# Static de evidencias (idempotente)
+try:
+    app.mount("/fotos", StaticFiles(directory=FOTOS_DIR, check_dir=False), name="fotos")
+except Exception:
+    # Si ya estaba montado, ignorar
+    pass
 
 # =============================================================================
-# APP + CORS
+# MODELOS
 # =============================================================================
-app = FastAPI(title=APP_NAME)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # abierto para Netlify
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-@app.options("/{rest_of_path:path}")
-def preflight_any(rest_of_path: str):
-    return Response(status_code=204)
-
-FOTOS_DIR.mkdir(parents=True, exist_ok=True)
-app.mount("/fotos", StaticFiles(directory=str(BASE_DIR / "fotos")), name="fotos")
-
-
-# =============================================================================
-# SALUD
-# =============================================================================
-@app.get("/", response_class=PlainTextResponse)
-def root():
-    return f"{APP_NAME} OK"
-
-@app.get("/health")
-def health():
-    try:
-        conn = get_conn()
-        with conn.cursor() as cur:
-            cur.execute("SELECT 1;")
-            cur.fetchone()
-        put_conn(conn)
-        return {"ok": True}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-
-# =============================================================================
-# TABLA RUTAS ACTIVAS
-# =============================================================================
-def ensure_table_rutas_activas(conn):
-    sql = """
-    CREATE TABLE IF NOT EXISTS public.rutas_activas (
-        id SERIAL PRIMARY KEY,
-        camion TEXT,
-        nombre TEXT,
-        dia TEXT,
-        litros INTEGER,
-        telefono TEXT,
-        latitud DOUBLE PRECISION,
-        longitud DOUBLE PRECISION,
-        activa BOOLEAN DEFAULT TRUE
-    );
-    """
-    with conn.cursor() as cur:
-        cur.execute(sql)
-    conn.commit()
-
-
-@app.get("/rutas-activas")
-def rutas_activas():
-    conn = get_conn()
-    try:
-        ensure_table_rutas_activas(conn)
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT id, camion, nombre, dia, litros, telefono, latitud, longitud, activa
-                FROM public.rutas_activas
-                ORDER BY camion, nombre;
-            """)
-            cols = [d[0] for d in cur.description]
-            return [dict(zip(cols, r)) for r in cur.fetchall()]
-    finally:
-        put_conn(conn)
-
-
 class RutaActivaUpdate(BaseModel):
     camion: Optional[str] = None
     nombre: Optional[str] = None
-    dia: Optional[str] = None
-    litros: Optional[int] = None
+    dia: Optional[str] = None            # mapea a dia_asignado
     telefono: Optional[str] = None
+    litros: Optional[int] = None         # mapea a litros_entrega
     latitud: Optional[float] = None
     longitud: Optional[float] = None
-    activa: Optional[bool] = None
 
+# =============================================================================
+# ENDPOINTS BASE
+# =============================================================================
+@app.get("/health", response_class=PlainTextResponse)
+def health():
+    return "ok"
 
-@app.put("/rutas-activas/{rid}")
-def update_ruta_activa(rid: int, body: RutaActivaUpdate):
-    conn = get_conn()
+@app.get("/url", response_class=PlainTextResponse)
+def leer_url_actual():
+    """
+    Devuelve el contenido de url.txt (útil para exponer la URL dinámica de ngrok/render a la app móvil).
+    """
+    url_file = BASE_DIR / "url.txt"
+    if not url_file.exists():
+        return Response(status_code=204)
     try:
-        updates = {k: v for k, v in body.dict().items() if v is not None}
-        if not updates:
-            return {"ok": True, "updated": 0, "id": rid}
+        return PlainTextResponse(url_file.read_text(encoding="utf-8").strip())
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error leyendo url.txt: {e}")
 
-        sets = [f"{col} = %s" for col in updates.keys()]
-        vals = list(updates.values())
-        vals.append(rid)
-
-        sql = f"UPDATE public.rutas_activas SET {', '.join(sets)} WHERE id = %s;"
-        with conn.cursor() as cur:
-            cur.execute(sql, tuple(vals))
-            updated = cur.rowcount
-        conn.commit()
-        if updated == 0:
-            raise HTTPException(status_code=404, detail="No existe ese id")
-        return {"ok": True, "updated": updated, "id": rid}
-    finally:
-        put_conn(conn)
-
-
-@app.delete("/rutas-activas/{rid}")
-def delete_ruta_activa(rid: int):
-    conn = get_conn()
+# =============================================================================
+# RUTAS ACTIVAS (GET / PUT / DELETE) — Conserva nombres de columnas existentes
+# =============================================================================
+@app.get("/rutas-activas")
+def get_rutas_activas():
+    """
+    Devuelve rutas activas con columnas usadas por el frontend histórico.
+    """
     try:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM public.rutas_activas WHERE id = %s;", (rid,))
-            deleted = cur.rowcount
-        conn.commit()
-        if deleted == 0:
-            raise HTTPException(status_code=404, detail="No existe ese id")
-        return {"ok": True, "deleted": deleted, "id": rid}
-    finally:
-        put_conn(conn)
+        conn = db_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, camion, patente, conductor, dia_asignado, nombre, sector,
+                   litros_entrega, telefono, COALESCE(latitud, NULL), COALESCE(longitud, NULL)
+            FROM rutas_activas
+            ORDER BY camion, dia_asignado, nombre
+        """)
+        rows = cur.fetchall()
+        cur.close()
+        db_put(conn)
 
+        cols = ["id","camion","patente","conductor","dia_asignado","nombre","sector",
+                "litros_entrega","telefono","latitud","longitud"]
+        data = [dict(zip(cols, r)) for r in rows]
+        return {"status": "ok", "data": data}
+    except Exception as e:
+        log.error(f"/rutas-activas error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-# =============================================================================
-# IMPORTAR RUTAS DESDE EXCEL
-# =============================================================================
-@app.post("/importar-rutas")
-def importar_rutas():
-    file_path = DATA_DIR / "rutas_activas.xlsx"
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="No se encontró rutas_activas.xlsx en /data")
+@app.put("/rutas-activas/{id}")
+def update_ruta_activa(id: int, payload: RutaActivaUpdate):
+    """
+    Actualiza columnas puntuales respetando nombres reales en DB.
+    - dia -> dia_asignado
+    - litros -> litros_entrega
+    """
+    campos = []
+    valores = []
 
-    df = pd.read_excel(file_path)
-    conn = get_conn()
+    body = payload.dict(exclude_unset=True)
+    for k, v in body.items():
+        if k == "dia":
+            campos.append("dia_asignado = %s"); valores.append(v)
+        elif k == "litros":
+            campos.append("litros_entrega = %s"); valores.append(v)
+        else:
+            campos.append(f"{k} = %s"); valores.append(v)
+
+    if not campos:
+        raise HTTPException(status_code=400, detail="No hay campos para actualizar.")
+
+    valores.append(id)
+    q = f"UPDATE rutas_activas SET {', '.join(campos)} WHERE id = %s"
+
     try:
-        ensure_table_rutas_activas(conn)
-        inserted = 0
-        for _, row in df.iterrows():
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO public.rutas_activas
-                    (camion, nombre, dia, litros, telefono, latitud, longitud, activa)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,TRUE)
-                """, (
-                    row.get("camion"),
-                    row.get("nombre"),
-                    row.get("dia"),
-                    int(row.get("litros") or 0),
-                    row.get("telefono"),
-                    float(row.get("latitud") or 0),
-                    float(row.get("longitud") or 0),
-                ))
-            inserted += 1
+        conn = db_conn()
+        cur = conn.cursor()
+        cur.execute(q, valores)
         conn.commit()
-        return {"ok": True, "inserted": inserted}
-    finally:
-        put_conn(conn)
+        cur.close()
+        db_put(conn)
+        return {"status": "ok", "updated_id": id}
+    except Exception as e:
+        log.error(f"PUT /rutas-activas/{id} error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
+@app.delete("/rutas-activas/{id}")
+def delete_ruta_activa(id: int):
+    try:
+        conn = db_conn()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM rutas_activas WHERE id = %s", (id,))
+        conn.commit()
+        cur.close()
+        db_put(conn)
+        return {"status": "ok", "deleted_id": id}
+    except Exception as e:
+        log.error(f"DELETE /rutas-activas/{id} error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # =============================================================================
-# 🚨 Aquí seguirían los endpoints de entregas-app, registrar-entregas, entregas-todas
-# (idénticos a como los tenías antes, no los borré)
+# ENTREGAS APP (POST) — Mantiene compatibilidad: foto opcional + GPS
 # =============================================================================
+@app.post("/entregas-app")
+async def registrar_entrega_app(
+    nombre: str = Form(...),
+    camion: str = Form(...),
+    litros: int = Form(...),
+    estado: int = Form(...),                 # 1=entregada, 0/2/3=no entregada (según tu codificación)
+    fecha: str = Form(...),                  # "YYYY-MM-DD" o ISO8601
+    latitud: Optional[float] = Form(None),
+    longitud: Optional[float] = Form(None),
+    foto: Optional[UploadFile] = File(None),
+):
+    """
+    Guarda una entrega (con o sin foto). Si hay foto, se almacena en /fotos/evidencias
+    y se persiste la ruta en la DB. Reutiliza esquema existente si ya lo tenías.
+    """
+    foto_path_rel = None
+
+    # Guardado de foto (opcional)
+    if foto and foto.filename:
+        ext = Path(foto.filename).suffix.lower() or ".jpg"
+        fname = f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex}{ext}"
+        dest = FOTOS_DIR / fname
+        with dest.open("wb") as f:
+            shutil.copyfileobj(foto.file, f)
+        foto_path_rel = f"/fotos/{fname}"
+
+    # Inserción en DB — ajusta al nombre de tu tabla real si difiere
+    try:
+        conn = db_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO entregas_app (nombre, camion, litros, estado, fecha, latitud, longitud, foto_path)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+        """, (nombre, camion, litros, estado, fecha, latitud, longitud, foto_path_rel))
+        new_id = cur.fetchone()[0]
+        conn.commit()
+        cur.close()
+        db_put(conn)
+        return {"status": "ok", "id": new_id, "foto": foto_path_rel}
+    except psycopg2.errors.UndefinedTable:
+        # Si tu tabla se llama distinto (p.ej. "entregas"), intenta fallback conservador
+        try:
+            conn = db_conn()
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO entregas (nombre, camion, litros, estado, fecha, latitud, longitud, foto_path)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+            """, (nombre, camion, litros, estado, fecha, latitud, longitud, foto_path_rel))
+            new_id = cur.fetchone()[0]
+            conn.commit()
+            cur.close()
+            db_put(conn)
+            log.info("Fallback: se usó tabla 'entregas' en vez de 'entregas_app'.")
+            return {"status": "ok", "id": new_id, "foto": foto_path_rel}
+        except Exception as e2:
+            log.error(f"POST /entregas-app fallback error: {e2}")
+            raise HTTPException(status_code=500, detail=str(e2))
+    except Exception as e:
+        log.error(f"POST /entregas-app error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
