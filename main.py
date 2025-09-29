@@ -1,4 +1,4 @@
-# main.py — Backend AguaRuta (conservador: no rompe lo existente)
+# main.py — Backend AguaRuta (versión nube con importador Excel)
 import os
 import uuid
 import shutil
@@ -15,32 +15,34 @@ from pydantic import BaseModel
 
 import psycopg2
 from psycopg2.pool import SimpleConnectionPool
+import pandas as pd
 
 # =============================================================================
 # CONFIG / LOGGING
 # =============================================================================
 APP_NAME = "AguaRuta Backend"
 BASE_DIR = Path(__file__).resolve().parent
+DATA_FILE = BASE_DIR / "data" / "RUTA ACTIVA.xlsx"
 FOTOS_DIR = BASE_DIR / "fotos" / "evidencias"
 FOTOS_DIR.mkdir(parents=True, exist_ok=True)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger(APP_NAME)
 
 # =============================================================================
-# DB POOL (reutiliza si ya existe)
+# DB POOL
 # =============================================================================
 DB_URL = os.getenv("DATABASE_URL") or os.getenv("DB_URL") or os.getenv("POSTGRES_URL")
 
 if 'pool' not in globals():
     if not DB_URL:
-        log.warning("No hay DATABASE_URL/DB_URL/POSTGRES_URL en entorno. Se asume pool existente o endpoints que no usan DB.")
+        log.warning("No hay DATABASE_URL/DB_URL/POSTGRES_URL en entorno.")
         pool = None
     else:
         pool = SimpleConnectionPool(1, 10, dsn=DB_URL)
         log.info("Pool Postgres creado.")
 
-# Helper DB
 def db_conn():
     if not pool:
         raise RuntimeError("Pool de DB no inicializado.")
@@ -51,7 +53,7 @@ def db_put(conn):
         pool.putconn(conn)
 
 # =============================================================================
-# APP (reutiliza si ya existe)
+# APP
 # =============================================================================
 try:
     app  # type: ignore
@@ -59,26 +61,20 @@ except NameError:
     app = FastAPI(title=APP_NAME)
     log.info("Instancia FastAPI creada.")
 
-# CORS (idempotente: no falla si se aplica dos veces)
 try:
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=[
-            os.getenv("FRONTEND_ORIGIN", "https://aguaruta.netlify.app"),
-            "*",  # respaldo
-        ],
+        allow_origins=[os.getenv("FRONTEND_ORIGIN", "https://aguaruta.netlify.app"), "*"],
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )
-except Exception as _e:
-    log.warning("No se pudo aplicar CORS (posible middleware duplicado). Continuando...")
+except Exception:
+    pass
 
-# Static de evidencias (idempotente)
 try:
     app.mount("/fotos", StaticFiles(directory=FOTOS_DIR, check_dir=False), name="fotos")
 except Exception:
-    # Si ya estaba montado, ignorar
     pass
 
 # =============================================================================
@@ -87,9 +83,9 @@ except Exception:
 class RutaActivaUpdate(BaseModel):
     camion: Optional[str] = None
     nombre: Optional[str] = None
-    dia: Optional[str] = None            # mapea a dia_asignado
+    dia: Optional[str] = None
     telefono: Optional[str] = None
-    litros: Optional[int] = None         # mapea a litros_entrega
+    litros: Optional[int] = None
     latitud: Optional[float] = None
     longitud: Optional[float] = None
 
@@ -102,9 +98,6 @@ def health():
 
 @app.get("/url", response_class=PlainTextResponse)
 def leer_url_actual():
-    """
-    Devuelve el contenido de url.txt (útil para exponer la URL dinámica de ngrok/render a la app móvil).
-    """
     url_file = BASE_DIR / "url.txt"
     if not url_file.exists():
         return Response(status_code=204)
@@ -114,19 +107,67 @@ def leer_url_actual():
         raise HTTPException(status_code=500, detail=f"Error leyendo url.txt: {e}")
 
 # =============================================================================
-# RUTAS ACTIVAS (GET / PUT / DELETE) — Conserva nombres de columnas existentes
+# IMPORTAR RUTA ACTIVA DESDE EXCEL
+# =============================================================================
+@app.post("/importar-ruta-activa")
+def importar_ruta_activa():
+    """
+    Carga el Excel 'RUTA ACTIVA.xlsx' en la tabla rutas_activas.
+    """
+    if not DATA_FILE.exists():
+        raise HTTPException(status_code=404, detail="No se encontró RUTA ACTIVA.xlsx")
+
+    try:
+        df = pd.read_excel(DATA_FILE)
+
+        # Normalizar columnas
+        df.rename(columns={
+            "ID CAMIÓN": "camion",
+            "DIA": "dia_asignado",
+            "LITROS DE ENTREGA": "litros_entrega",
+        }, inplace=True)
+
+        conn = db_conn()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM rutas_activas")
+
+        for _, row in df.iterrows():
+            cur.execute("""
+                INSERT INTO rutas_activas (camion, patente, conductor, dia_asignado, nombre, sector,
+                                           litros_entrega, telefono, latitud, longitud)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """, (
+                row.get("camion"),
+                row.get("PATENTE"),
+                row.get("CONDUCTOR"),
+                row.get("dia_asignado"),
+                row.get("NOMBRE"),
+                row.get("SECTOR"),
+                row.get("litros_entrega"),
+                row.get("telefono"),
+                row.get("latitud"),
+                row.get("longitud"),
+            ))
+
+        conn.commit()
+        cur.close()
+        db_put(conn)
+        return {"status": "ok", "rows_imported": len(df)}
+    except Exception as e:
+        log.error(f"Error importando Excel: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# =============================================================================
+# RUTAS ACTIVAS (GET / PUT / DELETE)
 # =============================================================================
 @app.get("/rutas-activas")
 def get_rutas_activas():
-    """
-    Devuelve rutas activas con columnas usadas por el frontend histórico.
-    """
     try:
         conn = db_conn()
         cur = conn.cursor()
         cur.execute("""
             SELECT id, camion, patente, conductor, dia_asignado, nombre, sector,
-                   litros_entrega, telefono, COALESCE(latitud, NULL), COALESCE(longitud, NULL)
+                   litros_entrega, telefono, COALESCE(latitud,NULL), COALESCE(longitud,NULL)
             FROM rutas_activas
             ORDER BY camion, dia_asignado, nombre
         """)
@@ -144,15 +185,9 @@ def get_rutas_activas():
 
 @app.put("/rutas-activas/{id}")
 def update_ruta_activa(id: int, payload: RutaActivaUpdate):
-    """
-    Actualiza columnas puntuales respetando nombres reales en DB.
-    - dia -> dia_asignado
-    - litros -> litros_entrega
-    """
-    campos = []
-    valores = []
-
+    campos, valores = [], []
     body = payload.dict(exclude_unset=True)
+
     for k, v in body.items():
         if k == "dia":
             campos.append("dia_asignado = %s"); valores.append(v)
@@ -194,26 +229,20 @@ def delete_ruta_activa(id: int):
         raise HTTPException(status_code=500, detail=str(e))
 
 # =============================================================================
-# ENTREGAS APP (POST) — Mantiene compatibilidad: foto opcional + GPS
+# ENTREGAS APP
 # =============================================================================
 @app.post("/entregas-app")
 async def registrar_entrega_app(
     nombre: str = Form(...),
     camion: str = Form(...),
     litros: int = Form(...),
-    estado: int = Form(...),                 # 1=entregada, 0/2/3=no entregada (según tu codificación)
-    fecha: str = Form(...),                  # "YYYY-MM-DD" o ISO8601
+    estado: int = Form(...),
+    fecha: str = Form(...),
     latitud: Optional[float] = Form(None),
     longitud: Optional[float] = Form(None),
     foto: Optional[UploadFile] = File(None),
 ):
-    """
-    Guarda una entrega (con o sin foto). Si hay foto, se almacena en /fotos/evidencias
-    y se persiste la ruta en la DB. Reutiliza esquema existente si ya lo tenías.
-    """
     foto_path_rel = None
-
-    # Guardado de foto (opcional)
     if foto and foto.filename:
         ext = Path(foto.filename).suffix.lower() or ".jpg"
         fname = f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex}{ext}"
@@ -222,14 +251,12 @@ async def registrar_entrega_app(
             shutil.copyfileobj(foto.file, f)
         foto_path_rel = f"/fotos/{fname}"
 
-    # Inserción en DB — ajusta al nombre de tu tabla real si difiere
     try:
         conn = db_conn()
         cur = conn.cursor()
         cur.execute("""
             INSERT INTO entregas_app (nombre, camion, litros, estado, fecha, latitud, longitud, foto_path)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            RETURNING id
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id
         """, (nombre, camion, litros, estado, fecha, latitud, longitud, foto_path_rel))
         new_id = cur.fetchone()[0]
         conn.commit()
@@ -237,23 +264,21 @@ async def registrar_entrega_app(
         db_put(conn)
         return {"status": "ok", "id": new_id, "foto": foto_path_rel}
     except psycopg2.errors.UndefinedTable:
-        # Si tu tabla se llama distinto (p.ej. "entregas"), intenta fallback conservador
         try:
             conn = db_conn()
             cur = conn.cursor()
             cur.execute("""
                 INSERT INTO entregas (nombre, camion, litros, estado, fecha, latitud, longitud, foto_path)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING id
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id
             """, (nombre, camion, litros, estado, fecha, latitud, longitud, foto_path_rel))
             new_id = cur.fetchone()[0]
             conn.commit()
             cur.close()
             db_put(conn)
-            log.info("Fallback: se usó tabla 'entregas' en vez de 'entregas_app'.")
+            log.info("Fallback: tabla 'entregas' usada.")
             return {"status": "ok", "id": new_id, "foto": foto_path_rel}
         except Exception as e2:
-            log.error(f"POST /entregas-app fallback error: {e2}")
+            log.error(f"Fallback entregas error: {e2}")
             raise HTTPException(status_code=500, detail=str(e2))
     except Exception as e:
         log.error(f"POST /entregas-app error: {e}")
