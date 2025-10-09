@@ -1,17 +1,16 @@
-# main.py — AguaRuta Backend (versión completa y estable)
-# Autor: Equipo AguaRuta — 2025-10-02
-# Características:
+# main.py — AguaRuta Backend (versión estable final)
+# Autor: Equipo AguaRuta — Octubre 2025
+# -------------------------------------------------------------------
+# Funciones:
 # - CRUD Rutas Activas (Excel/DB)
 # - Registrar nuevo punto
 # - Registrar entrega App (foto + GPS)
-# - Usuarios avanzados (CRUD + roles)
-# - Auditoría avanzada (filtros + export)
-# - Estadísticas, Gráficos, Comparación semanal
+# - Usuarios con JWT y roles
+# - Auditoría (logs locales o en DB)
+# - Estadísticas, gráficos, comparaciones
 # - Exportaciones Excel/PDF
-# - Alertas (sobrecarga y no entregadas)
-# - Mapa de puntos con colores por camión
-# - Preview/Import Excel -> DB
-# - Persistencia al editar desde AguaRuta
+# - Verificación automática de Excel en arranque
+# -------------------------------------------------------------------
 
 import os, uuid, shutil, logging, hashlib, json, base64, hmac
 from datetime import datetime, timedelta
@@ -74,7 +73,7 @@ app = FastAPI(title=APP_NAME)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # FIX: habilitamos todos los orígenes
+    allow_origins=["*"],   # abierto para Netlify/Expo
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -175,11 +174,13 @@ def audit_log(user: str, action: str, meta: dict):
 RUTAS_COLUMNS = ["id","camion","nombre","dia","litros","telefono","latitud","longitud"]
 
 def read_rutas_excel() -> pd.DataFrame:
-    if not EXCEL_FILE.exists(): raise HTTPException(404, "No se encontró rutas_activas.xlsx")
+    if not EXCEL_FILE.exists():
+        raise HTTPException(404, "No se encontró rutas_activas.xlsx")
     df = pd.read_excel(EXCEL_FILE)
     return df[[c for c in RUTAS_COLUMNS if c in df.columns]]
 
-def write_rutas_excel(df: pd.DataFrame): df.to_excel(EXCEL_FILE, index=False)
+def write_rutas_excel(df: pd.DataFrame):
+    df.to_excel(EXCEL_FILE, index=False)
 
 def read_rutas_db() -> pd.DataFrame:
     conn = db_conn(); cur = conn.cursor()
@@ -191,8 +192,13 @@ def read_rutas_db() -> pd.DataFrame:
 # ============================================================================
 # ENDPOINTS
 # ============================================================================
-@app.get("/health") def health(): return "ok"
-@app.get("/colores-camion") def colores_camion(): return CAMION_COLORS
+@app.get("/health")
+def health():
+    return "ok"
+
+@app.get("/colores-camion")
+def colores_camion(): 
+    return CAMION_COLORS
 
 # --- LOGIN / USUARIOS ---
 @app.post("/login")
@@ -277,3 +283,13 @@ def auditoria_list(user=Depends(require_admin)):
     cur.execute("SELECT usuario,accion,metadata,ts_utc FROM auditoria ORDER BY ts_utc DESC LIMIT 200")
     rows=cur.fetchall(); cur.close(); db_put(conn)
     return [{"usuario":r[0],"accion":r[1],"metadata":r[2],"ts":r[3]} for r in rows]
+
+# ============================================================================
+# VERIFICACIÓN AUTOMÁTICA AL INICIAR
+# ============================================================================
+@app.on_event("startup")
+def verificar_excel():
+    if EXCEL_FILE.exists():
+        log.info(f"🟢 Excel cargado correctamente desde: {EXCEL_FILE}")
+    else:
+        log.warning(f"🔴 No se encontró {EXCEL_FILE}, crea el archivo manualmente.")
