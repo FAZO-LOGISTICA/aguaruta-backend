@@ -1,5 +1,5 @@
-# main.py — AguaRuta Backend (versión estable con CORS corregido)
-# Autor: Equipo AguaRuta — Octubre 2025
+# main.py — AguaRuta Backend (versión definitiva octubre 2025)
+# Autor: Equipo AguaRuta
 
 import os, uuid, shutil, logging, hashlib, json, base64, hmac
 from datetime import datetime, timedelta
@@ -246,7 +246,10 @@ def get_rutas_activas(camion:Optional[str]=None,dia:Optional[str]=None,q:Optiona
     if camion: df=df[df["camion"].str.upper()==camion.upper()]
     if dia: df=df[df["dia"].str.upper()==dia.upper()]
     if q: df=df[df["nombre"].str.contains(q,case=False)|df["telefono"].astype(str).str.contains(q)]
-    return {"data":df.to_dict(orient="records")}
+    # 🔧 Limpieza de valores vacíos o fuera de rango
+    df = df.replace([float("inf"), float("-inf")], None)
+    df = df.fillna("")
+    return {"data": df.to_dict(orient="records")}
 
 @app.post("/rutas-activas")
 def add_ruta_activa(nuevo:NuevoPunto,user=Depends(require_auth)):
@@ -260,9 +263,12 @@ def add_ruta_activa(nuevo:NuevoPunto,user=Depends(require_auth)):
 @app.get("/mapa-puntos")
 def mapa_puntos():
     df = read_rutas_db() if DATA_MODE=="db" else read_rutas_excel()
-    df=df.dropna(subset=["latitud","longitud"])
-    df["color"]=df["camion"].apply(lambda c:CAMION_COLORS.get(str(c).upper(),"#1e40af"))
-    return {"data":df.to_dict(orient="records")}
+    df = df.dropna(subset=["latitud","longitud"], how="all")
+    df["color"] = df["camion"].apply(lambda c: CAMION_COLORS.get(str(c).upper(),"#1e40af"))
+    # 🔧 Limpieza de valores problemáticos
+    df = df.replace([float("inf"), float("-inf")], None)
+    df = df.fillna("")
+    return {"data": df.to_dict(orient="records")}
 
 # --- ENTREGAS APP ---
 @app.post("/entregas-app")
