@@ -1,27 +1,15 @@
-# main.py — AguaRuta Backend (versión estable final)
+# main.py — AguaRuta Backend (versión estable con CORS corregido)
 # Autor: Equipo AguaRuta — Octubre 2025
-# -------------------------------------------------------------------
-# Funciones:
-# - CRUD Rutas Activas (Excel/DB)
-# - Registrar nuevo punto
-# - Registrar entrega App (foto + GPS)
-# - Usuarios con JWT y roles
-# - Auditoría (logs locales o en DB)
-# - Estadísticas, gráficos, comparaciones
-# - Exportaciones Excel/PDF
-# - Verificación automática de Excel en arranque
-# -------------------------------------------------------------------
 
 import os, uuid, shutil, logging, hashlib, json, base64, hmac
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, Dict
 from io import BytesIO
 
 import pandas as pd
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Header, Query
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from reportlab.pdfgen import canvas
@@ -54,7 +42,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 log = logging.getLogger(APP_NAME)
 
 # ============================================================================
-# DB
+# DB (solo si se usa modo db)
 # ============================================================================
 pool = SimpleConnectionPool(1, 10, dsn=DB_URL) if DATA_MODE == "db" and DB_URL else None
 
@@ -67,16 +55,26 @@ def db_put(conn):
     if pool and conn: pool.putconn(conn)
 
 # ============================================================================
-# APP
+# APP + CORS
 # ============================================================================
 app = FastAPI(title=APP_NAME)
 
+# ✅ CORS corregido para Netlify + Render + local
+ALLOWED_ORIGINS = [
+    "https://aguaruta.netlify.app",
+    "http://localhost:5173",
+    "http://localhost:3000",
+    "*"
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # abierto para Netlify/Expo
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=600,
 )
 
 app.mount("/fotos", StaticFiles(directory=FOTOS_DIR, check_dir=False), name="fotos")
@@ -196,6 +194,10 @@ def read_rutas_db() -> pd.DataFrame:
 def health():
     return "ok"
 
+@app.get("/cors-test")
+def cors_test():
+    return {"status": "ok", "allowed_origins": ALLOWED_ORIGINS}
+
 @app.get("/colores-camion")
 def colores_camion(): 
     return CAMION_COLORS
@@ -285,7 +287,7 @@ def auditoria_list(user=Depends(require_admin)):
     return [{"usuario":r[0],"accion":r[1],"metadata":r[2],"ts":r[3]} for r in rows]
 
 # ============================================================================
-# VERIFICACIÓN AUTOMÁTICA AL INICIAR
+# STARTUP CHECK
 # ============================================================================
 @app.on_event("startup")
 def verificar_excel():
