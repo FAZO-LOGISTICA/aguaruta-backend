@@ -1,5 +1,5 @@
 # main.py — AguaRuta Backend
-# Versión: 2.1 BUGFIX
+# Versión: 2.2 FINAL
 
 import os, uuid, shutil, logging, hashlib, json, base64, hmac
 from datetime import datetime, timedelta
@@ -54,7 +54,7 @@ def db_put(conn):
 # ============================================================================
 # APP + CORS
 # ============================================================================
-app = FastAPI(title=APP_NAME, version="2.1 BUGFIX")
+app = FastAPI(title=APP_NAME, version="2.2 FINAL")
 
 app.add_middleware(
     CORSMiddleware,
@@ -91,7 +91,7 @@ class NuevaEntrega(BaseModel):
     camion: str
     nombre: str
     litros: int
-    estado: int  # 1=entregado, 0=no entregado
+    estado: int
     fecha: str
     motivo: Optional[str] = None
     telefono: Optional[str] = None
@@ -158,7 +158,6 @@ RUTAS_COLUMNS = ["id", "camion", "nombre", "dia", "litros", "telefono", "latitud
 
 def read_rutas_excel() -> pd.DataFrame:
     if not EXCEL_FILE.exists():
-        # Retornar DataFrame vacío con columnas correctas en vez de 404
         return pd.DataFrame(columns=RUTAS_COLUMNS)
     df = pd.read_excel(EXCEL_FILE)
     return df[[c for c in RUTAS_COLUMNS if c in df.columns]]
@@ -216,20 +215,19 @@ def generar_entregas_mock(desde: str = None, hasta: str = None) -> list:
         for camion in camiones:
             n_entregas = random.randint(3, 8)
             for _ in range(n_entregas):
-                # FIX 1: estado solo 0 o 1
-                estado = random.choice([1, 1, 1, 1, 0])
+                estado = random.choice([1, 1, 1, 2, 3])  # estados 1-3, mayoría entregadas
                 entregas.append({
                     "id": id_counter,
                     "camion": camion,
                     "nombre": random.choice(nombres),
-                    "litros": random.choice([500, 1000, 1500, 2000]),
+                    "litros": random.choice([500, 1000, 1500, 2000]) if estado == 1 else 0,
                     "estado": estado,
                     "fecha": fecha,
-                    "motivo": "Sin agua" if estado == 0 else None,
+                    "motivo": None if estado == 1 else "Sin moradores" if estado == 2 else "Dirección no existe",
                     "telefono": f"+569{random.randint(10000000, 99999999)}",
                     "latitud": -33.05 + random.uniform(-0.05, 0.05),
                     "longitud": -71.62 + random.uniform(-0.05, 0.05),
-                    "foto": None,
+                    "foto_url": None,
                     "fuente": "manual"
                 })
                 id_counter += 1
@@ -240,7 +238,7 @@ def generar_entregas_mock(desde: str = None, hasta: str = None) -> list:
 # ============================================================================
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "2.1 BUGFIX", "data_mode": DATA_MODE}
+    return {"status": "ok", "version": "2.2 FINAL", "data_mode": DATA_MODE}
 
 @app.get("/cors-test")
 def cors_test():
@@ -292,20 +290,61 @@ def get_entregas_todas(
         entregas = [e for e in entregas if e["camion"] == camion.upper()]
     return entregas
 
-# FIX 3: endpoint /registrar-entrega que el frontend llama
-@app.post("/registrar-entrega")
-def registrar_entrega_manual(entrega: NuevaEntrega):
+# ============================================================================
+# REGISTRAR ENTREGAS — endpoint principal usado por el frontend
+# Acepta multipart/form-data para recibir foto adjunta
+# Estados: 1=entregado | 2=sin moradores (foto) | 3=dir no existe | 4=camino malo (foto)
+# ============================================================================
+@app.post("/registrar-entregas")
+async def registrar_entregas(
+    nombre: str = Form(...),
+    camion: str = Form(...),
+    litros: int = Form(...),
+    estado: int = Form(...),
+    fecha: str = Form(...),
+    motivo: Optional[str] = Form(None),
+    latitud: Optional[float] = Form(None),
+    longitud: Optional[float] = Form(None),
+    foto: Optional[UploadFile] = File(None)
+):
+    foto_path = None
+    if foto and foto.filename:
+        fname = f"{uuid.uuid4().hex}.jpg"
+        dest = FOTOS_DIR / fname
+        with dest.open("wb") as f:
+            shutil.copyfileobj(foto.file, f)
+        foto_path = f"/fotos/{fname}"
+        log.info(f"[FOTO] Guardada: {foto_path}")
+
+    nueva = {
+        "id": int(datetime.now().timestamp()),
+        "nombre": nombre,
+        "camion": camion,
+        "litros": litros if estado == 1 else 0,
+        "estado": estado,
+        "fecha": fecha,
+        "motivo": motivo,
+        "latitud": latitud,
+        "longitud": longitud,
+        "foto_url": foto_path,
+        "fuente": "web",
+        "registrado_en": datetime.utcnow().isoformat()
+    }
+
+    log.info(f"[ENTREGA] camion={camion} nombre={nombre} estado={estado} fecha={fecha}")
+    audit_log("sistema", "registrar_entrega", {"camion": camion, "nombre": nombre, "estado": estado})
+
+    return {"status": "ok", "entrega": nueva}
+
+# Alias JSON por compatibilidad con otros clientes
+@app.post("/entregas")
+def registrar_entrega_json(entrega: NuevaEntrega):
     nueva = entrega.dict()
     nueva["id"] = int(datetime.now().timestamp())
     nueva["fuente"] = "manual"
-    nueva["foto"] = None
-    log.info(f"[ENTREGA] Nueva entrega manual: {nueva}")
+    nueva["foto_url"] = None
+    log.info(f"[ENTREGA-JSON] {nueva}")
     return {"status": "ok", "entrega": nueva}
-
-# Mantener también /entregas POST por compatibilidad
-@app.post("/entregas")
-def registrar_entrega(entrega: NuevaEntrega):
-    return registrar_entrega_manual(entrega)
 
 # ============================================================================
 # ESTADÍSTICAS CAMIÓN
@@ -358,7 +397,7 @@ def get_no_entregadas(
         hasta = datetime.now().strftime("%Y-%m-%d")
 
     entregas = generar_entregas_mock(desde, hasta)
-    no_entregadas = [e for e in entregas if e["estado"] == 0]
+    no_entregadas = [e for e in entregas if e["estado"] != 1]
     if camion:
         no_entregadas = [e for e in no_entregadas if e["camion"] == camion.upper()]
     return no_entregadas
@@ -393,7 +432,7 @@ async def registrar_entrega_app(
     foto: Optional[UploadFile] = File(None)
 ):
     foto_path = None
-    if foto:
+    if foto and foto.filename:
         fname = f"{uuid.uuid4().hex}.jpg"
         dest = FOTOS_DIR / fname
         with dest.open("wb") as f:
@@ -405,13 +444,13 @@ async def registrar_entrega_app(
         "nombre": nombre, "camion": camion, "litros": litros,
         "estado": estado, "fecha": fecha,
         "latitud": latitud, "longitud": longitud,
-        "foto": foto_path, "fuente": "app"
+        "foto_url": foto_path, "fuente": "app"
     }
     log.info(f"[ENTREGA-APP] {nueva}")
     return {"status": "ok", "entrega": nueva}
 
 # ============================================================================
-# RUTAS ACTIVAS — FIX 2: retorna array directo, no {"data": [...]}
+# RUTAS ACTIVAS
 # ============================================================================
 @app.get("/rutas-activas")
 def get_rutas_activas(
@@ -424,7 +463,6 @@ def get_rutas_activas(
     if dia: df = df[df["dia"].str.upper() == dia.upper()]
     if q: df = df[df["nombre"].str.contains(q, case=False) | df["telefono"].astype(str).str.contains(q)]
     df = df.replace([float("inf"), float("-inf")], None).fillna("")
-    # FIX 2: retornar array directo en vez de {"data": [...]}
     return df.to_dict(orient="records")
 
 @app.post("/rutas-activas")
@@ -508,4 +546,4 @@ def startup():
         log.info(f"🟢 Excel cargado: {EXCEL_FILE}")
     else:
         log.warning(f"🟡 Excel no encontrado — usando datos mock")
-    log.info(f"🚀 AguaRuta Backend v2.1 iniciado | DATA_MODE={DATA_MODE}")
+    log.info(f"🚀 AguaRuta Backend v2.2 FINAL | DATA_MODE={DATA_MODE}")
