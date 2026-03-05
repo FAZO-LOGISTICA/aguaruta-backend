@@ -542,25 +542,59 @@ def add_ruta_activa(nuevo: NuevoPunto):
 
 @app.put("/rutas-activas/{id}")
 def update_ruta_activa(id: int, cambios: dict):
-    df = read_rutas_excel()
-    if "id" not in df.columns or id not in df["id"].values:
-        raise HTTPException(404, f"Registro {id} no encontrado")
-    for key, val in cambios.items():
-        if key in df.columns and key != "id":
-            df.loc[df["id"] == id, key] = val
-    write_rutas_excel(df)
-    fila = df[df["id"] == id].iloc[0].to_dict()
-    log.info(f"[PUT] rutas-activas id={id} cambios={cambios}")
-    return {"status": "ok", "registro": fila}
+    if DATA_MODE == "db" and pool:
+        # Modo PostgreSQL
+        campos_validos = ["camion", "nombre", "dia", "litros", "telefono", "latitud", "longitud"]
+        sets = []
+        vals = []
+        for key, val in cambios.items():
+            if key in campos_validos:
+                sets.append(f"{key} = %s")
+                vals.append(val)
+        if not sets:
+            raise HTTPException(400, "Sin campos válidos para actualizar")
+        vals.append(id)
+        conn = db_conn(); cur = conn.cursor()
+        cur.execute(f"UPDATE rutas_activas SET {', '.join(sets)} WHERE id = %s", vals)
+        if cur.rowcount == 0:
+            cur.close(); db_put(conn)
+            raise HTTPException(404, f"Registro {id} no encontrado")
+        conn.commit()
+        cur.execute("SELECT id,camion,nombre,dia,litros,telefono,latitud,longitud FROM rutas_activas WHERE id=%s", (id,))
+        row = cur.fetchone()
+        cur.close(); db_put(conn)
+        log.info(f"[PUT DB] rutas-activas id={id} cambios={cambios}")
+        return {"status": "ok", "registro": dict(zip(RUTAS_COLUMNS, row))}
+    else:
+        # Modo Excel
+        df = read_rutas_excel()
+        if "id" not in df.columns or id not in df["id"].values:
+            raise HTTPException(404, f"Registro {id} no encontrado")
+        for key, val in cambios.items():
+            if key in df.columns and key != "id":
+                df.loc[df["id"] == id, key] = val
+        write_rutas_excel(df)
+        fila = df[df["id"] == id].iloc[0].to_dict()
+        log.info(f"[PUT EXCEL] rutas-activas id={id} cambios={cambios}")
+        return {"status": "ok", "registro": fila}
 
 @app.delete("/rutas-activas/{id}")
 def delete_ruta_activa(id: int):
-    df = read_rutas_excel()
-    if "id" not in df.columns or id not in df["id"].values:
-        raise HTTPException(404, f"Registro {id} no encontrado")
-    df = df[df["id"] != id].reset_index(drop=True)
-    write_rutas_excel(df)
-    log.info(f"[DELETE] rutas-activas id={id}")
+    if DATA_MODE == "db" and pool:
+        conn = db_conn(); cur = conn.cursor()
+        cur.execute("DELETE FROM rutas_activas WHERE id = %s", (id,))
+        if cur.rowcount == 0:
+            cur.close(); db_put(conn)
+            raise HTTPException(404, f"Registro {id} no encontrado")
+        conn.commit(); cur.close(); db_put(conn)
+        log.info(f"[DELETE DB] rutas-activas id={id}")
+    else:
+        df = read_rutas_excel()
+        if "id" not in df.columns or id not in df["id"].values:
+            raise HTTPException(404, f"Registro {id} no encontrado")
+        df = df[df["id"] != id].reset_index(drop=True)
+        write_rutas_excel(df)
+        log.info(f"[DELETE EXCEL] rutas-activas id={id}")
     return {"status": "ok", "deleted_id": id}
 
 @app.get("/mapa-puntos")
@@ -593,4 +627,78 @@ def auditoria_list():
 @app.on_event("startup")
 def startup():
     excel_ok = EXCEL_FILE.exists()
-    log.info(f"🚀 AguaRuta Backend v2.4 🔓SIN_USUARIOS | DATA_MODE={DATA_MODE} | Excel={'✅' if excel_ok else '⚠️ FALLBACK'} | Rutas fallback={len(RUTAS_FALLBACK)}")
+    log.info(f"🚀 AguaRuta Backend v2.5 🔓SIN_USUARIOS | DATA_MODE={DATA_MODE} | Excel={'✅' if excel_ok else '⚠️ FALLBACK'} | Rutas fallback={len(RUTAS_FALLBACK)}")
+
+    if DATA_MODE == "db" and pool:
+        _init_db()
+
+def _init_db():
+    """Crea tablas si no existen y carga datos iniciales desde RUTAS_FALLBACK si la tabla está vacía."""
+    try:
+        conn = db_conn(); cur = conn.cursor()
+
+        # ── Tabla rutas_activas ──
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS rutas_activas (
+                id        SERIAL PRIMARY KEY,
+                camion    VARCHAR(10),
+                nombre    VARCHAR(200),
+                dia       VARCHAR(20),
+                litros    INTEGER DEFAULT 0,
+                telefono  VARCHAR(50),
+                latitud   DOUBLE PRECISION,
+                longitud  DOUBLE PRECISION
+            )
+        """)
+
+        # ── Tabla auditoria ──
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS auditoria (
+                id        SERIAL PRIMARY KEY,
+                usuario   VARCHAR(100),
+                accion    VARCHAR(100),
+                metadata  TEXT,
+                ts_utc    VARCHAR(50)
+            )
+        """)
+
+        # ── Tabla usuarios ──
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS usuarios (
+                id            SERIAL PRIMARY KEY,
+                usuario       VARCHAR(100) UNIQUE,
+                password_hash VARCHAR(200),
+                rol           VARCHAR(50),
+                active        BOOLEAN DEFAULT TRUE,
+                created_at    TIMESTAMP DEFAULT NOW()
+            )
+        """)
+
+        conn.commit()
+        log.info("✅ Tablas creadas/verificadas en PostgreSQL")
+
+        # ── Cargar datos iniciales si la tabla está vacía ──
+        cur.execute("SELECT COUNT(*) FROM rutas_activas")
+        count = cur.fetchone()[0]
+
+        if count == 0:
+            log.info(f"📦 Tabla vacía — cargando {len(RUTAS_FALLBACK)} registros iniciales...")
+            for r in RUTAS_FALLBACK:
+                cur.execute("""
+                    INSERT INTO rutas_activas (camion, nombre, dia, litros, telefono, latitud, longitud)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    r.get("camion"), r.get("nombre"), r.get("dia"),
+                    r.get("litros", 0), r.get("telefono", ""),
+                    r.get("latitud"), r.get("longitud")
+                ))
+            conn.commit()
+            log.info(f"✅ {len(RUTAS_FALLBACK)} registros cargados en PostgreSQL")
+        else:
+            log.info(f"✅ PostgreSQL ya tiene {count} registros en rutas_activas")
+
+        cur.close()
+        db_put(conn)
+
+    except Exception as e:
+        log.error(f"❌ Error inicializando DB: {e}")
