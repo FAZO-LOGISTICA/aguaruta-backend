@@ -532,13 +532,36 @@ def get_rutas_activas(camion: Optional[str]=None, dia: Optional[str]=None, q: Op
     return df.to_dict(orient="records")
 
 @app.post("/rutas-activas")
-def add_ruta_activa(nuevo: NuevoPunto, user=Depends(require_auth)):
+def add_ruta_activa(nuevo: NuevoPunto):
     df = read_rutas_excel()
     new_id = int(df["id"].max() + 1 if not df.empty and "id" in df.columns else 1)
     row = {"id": new_id, **nuevo.dict()}
     df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
     write_rutas_excel(df)
     return {"status": "ok", "new_id": new_id}
+
+@app.put("/rutas-activas/{id}")
+def update_ruta_activa(id: int, cambios: dict):
+    df = read_rutas_excel()
+    if "id" not in df.columns or id not in df["id"].values:
+        raise HTTPException(404, f"Registro {id} no encontrado")
+    for key, val in cambios.items():
+        if key in df.columns and key != "id":
+            df.loc[df["id"] == id, key] = val
+    write_rutas_excel(df)
+    fila = df[df["id"] == id].iloc[0].to_dict()
+    log.info(f"[PUT] rutas-activas id={id} cambios={cambios}")
+    return {"status": "ok", "registro": fila}
+
+@app.delete("/rutas-activas/{id}")
+def delete_ruta_activa(id: int):
+    df = read_rutas_excel()
+    if "id" not in df.columns or id not in df["id"].values:
+        raise HTTPException(404, f"Registro {id} no encontrado")
+    df = df[df["id"] != id].reset_index(drop=True)
+    write_rutas_excel(df)
+    log.info(f"[DELETE] rutas-activas id={id}")
+    return {"status": "ok", "deleted_id": id}
 
 @app.get("/mapa-puntos")
 def mapa_puntos():
@@ -551,33 +574,23 @@ def mapa_puntos():
 
 @app.post("/login")
 def login(creds: Credenciales):
-    usuario, pwd = creds.usuario.strip(), creds.password.strip()
-    phash = hashlib.sha256(pwd.encode()).hexdigest()
-    if DATA_MODE == "db" and pool:
-        conn = db_conn(); cur = conn.cursor()
-        cur.execute("SELECT password_hash, rol, active FROM usuarios WHERE usuario=%s", (usuario,))
-        row = cur.fetchone(); cur.close(); db_put(conn)
-        if not row or row[0] != phash or not row[2]:
-            raise HTTPException(401, "Credenciales inválidas")
-        rol = row[1]
-    else:
-        if usuario == "admin" and pwd == "admin": rol = "admin"
-        elif usuario == "editor" and pwd == "editor": rol = "editor"
-        elif usuario == "invitado" and pwd == "invitado": rol = "invitado"
-        else: raise HTTPException(401, "Credenciales inválidas")
+    # 🔓 MODO SIN USUARIOS — acceso libre, cualquier credencial es válida
+    usuario = creds.usuario.strip() or "admin"
+    rol = "admin"  # todos entran como admin mientras no hay usuarios configurados
     token = jwt_encode({"sub": usuario, "rol": rol})
-    audit_log(usuario, "login", {"rol": rol})
+    audit_log(usuario, "login", {"rol": rol, "modo": "sin_usuarios"})
     return {"token": token, "rol": rol}
 
 @app.get("/usuarios")
-def listar_usuarios(user=Depends(require_admin)):
-    return [{"usuario": "admin", "rol": "admin", "active": True}]
+def listar_usuarios():
+    # Sin autenticación requerida en modo libre
+    return []
 
 @app.get("/auditoria")
-def auditoria_list(user=Depends(require_admin)):
+def auditoria_list():
     return []
 
 @app.on_event("startup")
 def startup():
     excel_ok = EXCEL_FILE.exists()
-    log.info(f"🚀 AguaRuta Backend v2.3 | DATA_MODE={DATA_MODE} | Excel={'✅' if excel_ok else '⚠️ FALLBACK'} | Rutas fallback={len(RUTAS_FALLBACK)}")
+    log.info(f"🚀 AguaRuta Backend v2.4 🔓SIN_USUARIOS | DATA_MODE={DATA_MODE} | Excel={'✅' if excel_ok else '⚠️ FALLBACK'} | Rutas fallback={len(RUTAS_FALLBACK)}")
