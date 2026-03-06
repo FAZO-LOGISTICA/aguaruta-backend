@@ -1352,8 +1352,9 @@ def _init_db():
         cur.execute("SELECT COUNT(*) FROM rutas_activas")
         count = cur.fetchone()[0]
 
-        if count == 0:
-            log.info(f"📦 Tabla vacía — cargando {len(RUTAS_FALLBACK)} registros iniciales...")
+        if count < len(RUTAS_FALLBACK):
+            log.info(f"📦 DB tiene {count} registros, fallback tiene {len(RUTAS_FALLBACK)} — sincronizando...")
+            cur.execute("DELETE FROM rutas_activas")
             for r in RUTAS_FALLBACK:
                 cur.execute("""
                     INSERT INTO rutas_activas (camion, nombre, dia, litros, telefono, latitud, longitud)
