@@ -1,5 +1,5 @@
 # main.py — AguaRuta Backend
-# Versión: 2.5 — Datos reales embebidos como fallback (Render-safe)
+# Versión: 2.3 — Datos reales embebidos como fallback (Render-safe)
 
 import os, uuid, shutil, logging, hashlib, json, base64, hmac
 from datetime import datetime, timedelta
@@ -262,7 +262,7 @@ def db_put(conn):
 # ============================================================================
 # APP + CORS
 # ============================================================================
-app = FastAPI(title=APP_NAME, version="2.3")
+app = FastAPI(title=APP_NAME, version="2.5")
 
 app.add_middleware(
     CORSMiddleware,
@@ -435,7 +435,7 @@ def generar_entregas_mock(desde: str = None, hasta: str = None) -> list:
 # ============================================================================
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "2.3", "data_mode": DATA_MODE,
+    return {"status": "ok", "version": "2.5", "data_mode": DATA_MODE,
             "excel_exists": EXCEL_FILE.exists(), "fallback_records": len(RUTAS_FALLBACK)}
 
 @app.get("/cors-test")
