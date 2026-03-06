@@ -1,5 +1,5 @@
 # main.py — AguaRuta Backend
-# Versión: 2.3 — Datos reales embebidos como fallback (Render-safe)
+# Versión: 2.5 — Datos reales embebidos como fallback (Render-safe)
 
 import os, uuid, shutil, logging, hashlib, json, base64, hmac
 from datetime import datetime, timedelta
