@@ -999,6 +999,28 @@ def get_familias(camion: Optional[str] = Query(None), q: Optional[str] = Query(N
     return rows
 
 
+@app.put("/familias/{familia_id}")
+def update_familia(familia_id: int, cambios: dict):
+    if not (DATA_MODE == "db" and pool):
+        raise HTTPException(503, "DB no disponible")
+    campos_validos = ["nombre", "camion", "litros", "telefono"]
+    sets = []; vals = []
+    for key, val in cambios.items():
+        if key in campos_validos:
+            sets.append(f"{key} = %s"); vals.append(val)
+    if not sets:
+        raise HTTPException(400, "Sin campos válidos")
+    vals.append(familia_id)
+    conn = db_conn(); cur = conn.cursor()
+    cur.execute(f"UPDATE familias SET {', '.join(sets)} WHERE id = %s AND activo = TRUE", vals)
+    if cur.rowcount == 0:
+        cur.close(); db_put(conn)
+        raise HTTPException(404, "Familia no encontrada")
+    conn.commit(); cur.close(); db_put(conn)
+    log.info(f"[FAMILIA] id={familia_id} actualizada: {cambios}")
+    return {"status": "ok"}
+
+
 @app.get("/familias/{familia_id}")
 def get_familia(familia_id: int):
     """Detalle de una familia con residentes y últimos pagos."""
