@@ -1,5 +1,5 @@
 # main.py — AguaRuta Backend
-# Versión: 2.9 — Módulo de Pagos: familias, residentes, historial
+# Versión: 2.9.1 — Fix cierre de mes: savepoint para deuda acumulada
 
 import os, uuid, shutil, logging, hashlib, json, base64, hmac
 from datetime import datetime, timedelta
@@ -107,7 +107,7 @@ def db_put(conn):
 # ============================================================================
 # APP + CORS
 # ============================================================================
-app = FastAPI(title=APP_NAME, version="2.7")
+app = FastAPI(title=APP_NAME, version="2.9.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -157,7 +157,7 @@ class NuevaEntrega(BaseModel):
 class PrecioMes(BaseModel):
     anio: int
     mes: int
-    precio_unitario: float  # precio por entrega de 700L
+    precio_unitario: float
 
 class Residente(BaseModel):
     nombre: str
@@ -169,7 +169,7 @@ class RegistrarPago(BaseModel):
     anio: int
     mes: int
     monto: float
-    forma_pago: str  # efectivo / transferencia / otro
+    forma_pago: str
     observacion: Optional[str] = None
 
 # ============================================================================
@@ -249,7 +249,6 @@ def read_entregas_db(
     desde=None, hasta=None, camion=None, estado=None,
     fecha=None, limit=1000
 ) -> list:
-    """Lee entregas reales desde PostgreSQL con filtros opcionales."""
     if not (DATA_MODE == "db" and pool):
         return []
     try:
@@ -351,7 +350,7 @@ def generar_entregas_mock(desde: str = None, hasta: str = None) -> list:
 # ============================================================================
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "2.9", "data_mode": DATA_MODE,
+    return {"status": "ok", "version": "2.9.1", "data_mode": DATA_MODE,
             "excel_exists": EXCEL_FILE.exists(), "fallback_records": len(RUTAS_FALLBACK)}
 
 @app.get("/cors-test")
@@ -367,7 +366,7 @@ def get_camiones(only_active: Optional[bool] = None):
     return c
 
 # ============================================================================
-# ENDPOINTS — ENTREGAS REALES (conectados a PostgreSQL)
+# ENDPOINTS — ENTREGAS REALES
 # ============================================================================
 
 @app.get("/entregas")
@@ -379,14 +378,10 @@ def get_entregas(
 ):
     if not desde: desde = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
     if not hasta: hasta = datetime.now().strftime("%Y-%m-%d")
-
-    # Intentar desde DB real
     if DATA_MODE == "db" and pool:
         rows = read_entregas_db(desde=desde, hasta=hasta, camion=camion, estado=estado)
         if rows is not None:
             return rows
-
-    # Fallback mock
     e = generar_entregas_mock(desde, hasta)
     if camion: e = [x for x in e if x["camion"] == camion.upper()]
     if estado is not None: e = [x for x in e if x["estado"] == estado]
@@ -402,14 +397,10 @@ def get_entregas_todas(
 ):
     if not desde: desde = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
     if not hasta: hasta = datetime.now().strftime("%Y-%m-%d")
-
-    # Intentar desde DB real
     if DATA_MODE == "db" and pool:
         rows = read_entregas_db(desde=desde, hasta=hasta, camion=camion, estado=estado, limit=2000)
         if rows is not None:
             return rows
-
-    # Fallback mock
     e = generar_entregas_mock(desde, hasta)
     if camion: e = [x for x in e if x["camion"] == camion.upper()]
     if estado is not None: e = [x for x in e if x["estado"] == estado]
@@ -460,8 +451,6 @@ async def registrar_entregas(
                 shutil.copyfileobj(foto.file, f)
             foto_url = f"/fotos/{fname}"
 
-    # Para estados 5 y 6 se guarda la cantidad real enviada
-    # Para resto de estados no-entrega se guarda 0
     litros_real = litros if estado in [1, 5, 6, 7] else 0
     registrado_en = datetime.utcnow().isoformat()
 
@@ -562,7 +551,6 @@ def get_entregas_app(
         except Exception as e:
             log.error(f"[ENTREGAS-APP DB ERROR] {e}")
 
-    # Fallback mock
     if not desde: desde = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
     if not hasta: hasta = datetime.now().strftime("%Y-%m-%d")
     e = generar_entregas_mock(desde, hasta)
@@ -610,7 +598,7 @@ def registrar_entrega_json(entrega: NuevaEntrega):
 
 
 # ============================================================================
-# ENDPOINTS — ESTADÍSTICAS Y NO-ENTREGADAS (datos reales)
+# ENDPOINTS — ESTADÍSTICAS Y NO-ENTREGADAS
 # ============================================================================
 
 @app.get("/estadisticas-camion")
@@ -622,13 +610,11 @@ def estadisticas_camion(
     if not desde: desde = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
     if not hasta: hasta = datetime.now().strftime("%Y-%m-%d")
 
-    # Intentar desde DB real
     if DATA_MODE == "db" and pool:
         rows = read_entregas_db(desde=desde, hasta=hasta, camion=camion, limit=5000)
     else:
         rows = []
 
-    # Si no hay datos reales, usar mock
     if not rows:
         rows = generar_entregas_mock(desde, hasta)
         if camion: rows = [x for x in rows if x["camion"] == camion.upper()]
@@ -661,17 +647,14 @@ def get_no_entregadas(
     if not desde: desde = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
     if not hasta: hasta = datetime.now().strftime("%Y-%m-%d")
 
-    # Intentar desde DB real
     if DATA_MODE == "db" and pool:
         rows = read_entregas_db(desde=desde, hasta=hasta, camion=camion, limit=2000)
         if rows is not None:
-            # Filtrar no-entregadas (todo menos estados 1,5,6,7)
             no_e = [x for x in rows if int(x.get("estado", 0)) not in [1, 5, 6, 7]]
             if estado is not None:
                 no_e = [x for x in no_e if int(x.get("estado", 0)) == estado]
             return no_e
 
-    # Fallback mock
     e = [x for x in generar_entregas_mock(desde, hasta) if x["estado"] != 1]
     if camion: e = [x for x in e if x["camion"] == camion.upper()]
     if estado is not None: e = [x for x in e if x["estado"] == estado]
@@ -781,16 +764,14 @@ def auditoria_list():
 @app.on_event("startup")
 def startup():
     excel_ok = EXCEL_FILE.exists()
-    log.info(f"🚀 AguaRuta Backend v2.7 | DATA_MODE={DATA_MODE} | Excel={'✅' if excel_ok else '⚠️ FALLBACK'} | Rutas fallback={len(RUTAS_FALLBACK)}")
+    log.info(f"🚀 AguaRuta Backend v2.9.1 | DATA_MODE={DATA_MODE} | Excel={'✅' if excel_ok else '⚠️ FALLBACK'} | Rutas fallback={len(RUTAS_FALLBACK)}")
     if DATA_MODE == "db" and pool:
         _init_db()
 
 def _init_db():
-    """Crea tablas si no existen y sincroniza datos iniciales."""
     try:
         conn = db_conn(); cur = conn.cursor()
 
-        # ── Tabla rutas_activas ──
         cur.execute("""
             CREATE TABLE IF NOT EXISTS rutas_activas (
                 id        SERIAL PRIMARY KEY,
@@ -804,7 +785,6 @@ def _init_db():
             )
         """)
 
-        # ── Tabla entregas ──
         cur.execute("""
             CREATE TABLE IF NOT EXISTS entregas (
                 id             SERIAL PRIMARY KEY,
@@ -823,7 +803,6 @@ def _init_db():
             )
         """)
 
-        # ── Tabla auditoria ──
         cur.execute("""
             CREATE TABLE IF NOT EXISTS auditoria (
                 id        SERIAL PRIMARY KEY,
@@ -834,7 +813,6 @@ def _init_db():
             )
         """)
 
-        # ── Tabla usuarios ──
         cur.execute("""
             CREATE TABLE IF NOT EXISTS usuarios (
                 id            SERIAL PRIMARY KEY,
@@ -846,7 +824,6 @@ def _init_db():
             )
         """)
 
-        # ── Tabla familias (jefes de hogar) ──
         cur.execute("""
             CREATE TABLE IF NOT EXISTS familias (
                 id          SERIAL PRIMARY KEY,
@@ -860,7 +837,6 @@ def _init_db():
             )
         """)
 
-        # ── Tabla residentes (miembros del grupo familiar) ──
         cur.execute("""
             CREATE TABLE IF NOT EXISTS residentes (
                 id          SERIAL PRIMARY KEY,
@@ -872,7 +848,6 @@ def _init_db():
             )
         """)
 
-        # ── Tabla precios_mes ──
         cur.execute("""
             CREATE TABLE IF NOT EXISTS precios_mes (
                 id               SERIAL PRIMARY KEY,
@@ -884,7 +859,6 @@ def _init_db():
             )
         """)
 
-        # ── Tabla pagos ──
         cur.execute("""
             CREATE TABLE IF NOT EXISTS pagos (
                 id          SERIAL PRIMARY KEY,
@@ -899,7 +873,6 @@ def _init_db():
             )
         """)
 
-        # ── Tabla cierres_detalle ──
         cur.execute("""
             CREATE TABLE IF NOT EXISTS cierres_detalle (
                 id           SERIAL PRIMARY KEY,
@@ -919,7 +892,6 @@ def _init_db():
             )
         """)
 
-        # ── Tabla cierres_mes ──
         cur.execute("""
             CREATE TABLE IF NOT EXISTS cierres_mes (
                 id               SERIAL PRIMARY KEY,
@@ -940,9 +912,8 @@ def _init_db():
         """)
 
         conn.commit()
-        log.info("✅ Tablas creadas/verificadas en PostgreSQL (v2.9)")
+        log.info("✅ Tablas creadas/verificadas en PostgreSQL (v2.9.1)")
 
-        # ── Sincronizar rutas_activas si está incompleta ──
         cur.execute("SELECT COUNT(*) FROM rutas_activas")
         count = cur.fetchone()[0]
 
@@ -970,19 +941,15 @@ def _init_db():
         log.error(f"❌ Error inicializando DB: {e}")
 
 # ============================================================================
-# ENDPOINTS — MÓDULO PAGOS v2.8
+# ENDPOINTS — MÓDULO PAGOS v2.9.1
 # ============================================================================
-
-# ── FAMILIAS ──
 
 @app.get("/familias")
 def get_familias(camion: Optional[str] = Query(None), q: Optional[str] = Query(None)):
-    """Lista jefes de hogar, opcionalmente sincronizando desde rutas_activas."""
     if not (DATA_MODE == "db" and pool):
         raise HTTPException(503, "DB no disponible")
     conn = db_conn(); cur = conn.cursor()
 
-    # Auto-sincronizar familias desde rutas_activas si están vacías
     cur.execute("SELECT COUNT(*) FROM familias")
     if cur.fetchone()[0] == 0:
         cur.execute("SELECT id, camion, nombre, litros, telefono FROM rutas_activas")
@@ -1037,13 +1004,11 @@ def update_familia(familia_id: int, cambios: dict):
         cur.close(); db_put(conn)
         raise HTTPException(404, "Familia no encontrada")
     conn.commit(); cur.close(); db_put(conn)
-    log.info(f"[FAMILIA] id={familia_id} actualizada: {cambios}")
     return {"status": "ok"}
 
 
 @app.get("/familias/{familia_id}")
 def get_familia(familia_id: int):
-    """Detalle de una familia con residentes y últimos pagos."""
     if not (DATA_MODE == "db" and pool):
         raise HTTPException(503, "DB no disponible")
     conn = db_conn(); cur = conn.cursor()
@@ -1060,14 +1025,12 @@ def get_familia(familia_id: int):
     familia["personas"] = familia["litros"] // 700
     familia["litros_extra"] = familia["litros"] % 700
 
-    # Residentes
     cur.execute("""
         SELECT id, nombre, rut, observacion
         FROM residentes WHERE familia_id = %s ORDER BY id
     """, (familia_id,))
     familia["residentes"] = [dict(zip(["id","nombre","rut","observacion"], r)) for r in cur.fetchall()]
 
-    # Últimos 12 pagos
     cur.execute("""
         SELECT id, anio, mes, monto, forma_pago, observacion, created_at
         FROM pagos WHERE familia_id = %s
@@ -1078,8 +1041,6 @@ def get_familia(familia_id: int):
     cur.close(); db_put(conn)
     return familia
 
-
-# ── RESIDENTES ──
 
 @app.post("/familias/{familia_id}/residentes")
 def agregar_residente(familia_id: int, residente: Residente):
@@ -1115,8 +1076,6 @@ def eliminar_residente(residente_id: int):
     return {"status": "ok"}
 
 
-# ── PRECIOS ──
-
 @app.get("/precios-mes")
 def get_precios():
     if not (DATA_MODE == "db" and pool):
@@ -1143,8 +1102,6 @@ def set_precio_mes(precio: PrecioMes):
     return {"status": "ok", "id": new_id}
 
 
-# ── PAGOS ──
-
 @app.post("/pagos")
 def registrar_pago(pago: RegistrarPago):
     if not (DATA_MODE == "db" and pool):
@@ -1169,8 +1126,6 @@ def eliminar_pago(pago_id: int):
     return {"status": "ok"}
 
 
-# ── RESUMEN MENSUAL (pagados vs morosos) ──
-
 @app.get("/resumen-pagos")
 def resumen_pagos(
     anio: int = Query(...),
@@ -1182,7 +1137,6 @@ def resumen_pagos(
         raise HTTPException(503, "DB no disponible")
     conn = db_conn(); cur = conn.cursor()
 
-    # Auto-sincronizar familias desde rutas_activas si estan vacias
     cur.execute("SELECT COUNT(*) FROM familias")
     if cur.fetchone()[0] == 0:
         cur.execute("SELECT id, camion, nombre, litros, telefono FROM rutas_activas")
@@ -1193,9 +1147,7 @@ def resumen_pagos(
                 (r[0], r[1], r[2], r[3] or 700, r[4] or "")
             )
         conn.commit()
-        log.info(f"[RESUMEN-PAGOS] {len(rutas_sync)} familias sincronizadas automaticamente")
 
-    # Si hay filtro de día: obtener los nombres que tienen ese día en rutas_activas
     nombres_dia = None
     if dia and camion:
         cur.execute(
@@ -1203,7 +1155,6 @@ def resumen_pagos(
             (dia.upper(), camion.upper())
         )
         nombres_dia = {r[0].strip().lower() for r in cur.fetchall()}
-        log.info(f"[RESUMEN-PAGOS] dia={dia} camion={camion} → {len(nombres_dia)} personas")
     elif dia:
         cur.execute(
             "SELECT DISTINCT nombre FROM rutas_activas WHERE UPPER(dia)=%s",
@@ -1211,12 +1162,10 @@ def resumen_pagos(
         )
         nombres_dia = {r[0].strip().lower() for r in cur.fetchall()}
 
-    # Precio del mes
     cur.execute("SELECT precio_unitario FROM precios_mes WHERE anio=%s AND mes=%s", (anio, mes))
     precio_row = cur.fetchone()
     precio_unitario = float(precio_row[0]) if precio_row else 0
 
-    # Entregas del mes por familia
     mes_str = f"{anio}-{mes:02d}"
     conditions = ["e.fecha LIKE %s"]
     params = [f"{mes_str}%"]
@@ -1235,7 +1184,6 @@ def resumen_pagos(
             "entregas": row[2], "litros_total": row[3] or 0
         }
 
-    # Familias
     fam_conditions = ["f.activo = TRUE"]
     fam_params = []
     if camion:
@@ -1254,18 +1202,13 @@ def resumen_pagos(
     resultado = []
     for row in cur.fetchall():
         fid, nombre, cam, litros, pagado = row
-
-        # Filtrar por día si corresponde
         if nombres_dia is not None and nombre.strip().lower() not in nombres_dia:
             continue
-
         personas = litros // 700
         data_entrega = entregas_map.get(nombre.strip().lower(), {"entregas": 0, "litros_total": 0})
         n_entregas = data_entrega["entregas"]
-        # Cobro = entregas × (litros/700) × precio_unitario
         cobro_calculado = n_entregas * personas * precio_unitario if precio_unitario > 0 else 0
         deuda = max(0, cobro_calculado - float(pagado))
-        # Días de entrega de esta familia
         cur.execute("SELECT DISTINCT dia FROM rutas_activas WHERE nombre ILIKE %s", (nombre,))
         dias_familia = [r[0].upper() for r in cur.fetchall() if r[0]]
 
@@ -1305,11 +1248,15 @@ def resumen_pagos(
     }
 
 # ============================================================================
-# ENDPOINTS — CIERRE DE MES v2.9
+# ENDPOINTS — CIERRE DE MES v2.9.1
 # ============================================================================
 
 def _calcular_resumen_mes(cur, anio: int, mes: int) -> dict:
-    """Calcula el resumen completo de un mes para cierre o informe."""
+    """
+    Calcula el resumen completo de un mes para cierre o informe.
+    FIX v2.9.1: usa SAVEPOINT para la query de deuda acumulada,
+    evitando que un error aborte toda la transacción de PostgreSQL.
+    """
     mes_str = f"{anio}-{mes:02d}"
 
     # Precio del mes
@@ -1350,20 +1297,26 @@ def _calcular_resumen_mes(cur, anio: int, mes: int) -> dict:
         cobro = n_entregas * personas * precio_unitario if precio_unitario > 0 else 0
         deuda_mes = max(0, cobro - float(pagado))
 
-        # Deuda acumulada (meses anteriores cerrados con deuda)
+        # ── FIX: Deuda acumulada con SAVEPOINT ──────────────────────────────
+        # Si cierres_detalle no existe aún o no tiene datos, la query puede
+        # lanzar una excepción que aborta toda la transacción en PostgreSQL.
+        # El SAVEPOINT permite recuperarnos sin perder el contexto.
         deuda_acumulada = 0
         try:
+            cur.execute("SAVEPOINT sp_deuda")
             cur.execute(
-                "SELECT COALESCE(SUM(deuda),0) FROM cierres_detalle "
-                "WHERE familia_id=%s AND (anio<%s OR (anio=%s AND mes<%s)) AND deuda>0",
+                "SELECT COALESCE(SUM(deuda), 0) FROM cierres_detalle "
+                "WHERE familia_id = %s AND (anio < %s OR (anio = %s AND mes < %s)) AND deuda > 0",
                 (fid, anio, anio, mes)
             )
             row_acum = cur.fetchone()
             deuda_acumulada = float(row_acum[0]) if row_acum else 0
-        except Exception:
-            try: conn.rollback()
-            except: pass
+            cur.execute("RELEASE SAVEPOINT sp_deuda")
+        except Exception as e:
+            log.warning(f"[deuda_acumulada] familia_id={fid} — rollback savepoint: {e}")
+            cur.execute("ROLLBACK TO SAVEPOINT sp_deuda")
             deuda_acumulada = 0
+        # ────────────────────────────────────────────────────────────────────
 
         # Residentes
         cur.execute("SELECT nombre, rut FROM residentes WHERE familia_id = %s ORDER BY id", (fid,))
@@ -1416,12 +1369,10 @@ def _calcular_resumen_mes(cur, anio: int, mes: int) -> dict:
 
 @app.post("/cierres-mes")
 def cerrar_mes(anio: int = Query(...), mes: int = Query(...)):
-    """Cierra el mes — guarda snapshot del estado financiero."""
     if not (DATA_MODE == "db" and pool):
         raise HTTPException(503, "DB no disponible")
     conn = db_conn(); cur = conn.cursor()
 
-    # Verificar si ya está cerrado
     cur.execute("SELECT estado FROM cierres_mes WHERE anio=%s AND mes=%s", (anio, mes))
     cierre_existente = cur.fetchone()
     if cierre_existente and cierre_existente[0] == "cerrado":
@@ -1431,7 +1382,6 @@ def cerrar_mes(anio: int = Query(...), mes: int = Query(...)):
     data = _calcular_resumen_mes(cur, anio, mes)
     r = data["resumen"]
 
-    # Crear tabla cierres_detalle si no existe
     cur.execute("""
         CREATE TABLE IF NOT EXISTS cierres_detalle (
             id           SERIAL PRIMARY KEY,
@@ -1451,7 +1401,6 @@ def cerrar_mes(anio: int = Query(...), mes: int = Query(...)):
         )
     """)
 
-    # Insertar o actualizar cierre
     cur.execute("""
         INSERT INTO cierres_mes
             (anio, mes, cerrado_por, precio_unitario, total_familias,
@@ -1472,10 +1421,8 @@ def cerrar_mes(anio: int = Query(...), mes: int = Query(...)):
           r["total_cobrado"], r["total_pagado"], r["total_deuda"]))
     cierre_id = cur.fetchone()[0]
 
-    # Limpiar detalle anterior si reabre
     cur.execute("DELETE FROM cierres_detalle WHERE cierre_id=%s", (cierre_id,))
 
-    # Guardar detalle por familia
     for f in data["familias"]:
         cur.execute("""
             INSERT INTO cierres_detalle
@@ -1493,7 +1440,6 @@ def cerrar_mes(anio: int = Query(...), mes: int = Query(...)):
 
 @app.post("/cierres-mes/reabrir")
 def reabrir_mes(anio: int = Query(...), mes: int = Query(...)):
-    """Reabre un mes cerrado para correcciones."""
     if not (DATA_MODE == "db" and pool):
         raise HTTPException(503, "DB no disponible")
     conn = db_conn(); cur = conn.cursor()
@@ -1511,7 +1457,6 @@ def reabrir_mes(anio: int = Query(...), mes: int = Query(...)):
 
 @app.get("/cierres-mes")
 def listar_cierres():
-    """Lista todos los cierres registrados."""
     if not (DATA_MODE == "db" and pool):
         raise HTTPException(503, "DB no disponible")
     conn = db_conn(); cur = conn.cursor()
@@ -1525,7 +1470,6 @@ def listar_cierres():
             "total_pagados","total_morosos","total_cobrado","total_pagado",
             "total_deuda","precio_unitario"]
     rows = [dict(zip(cols, r)) for r in cur.fetchall()]
-    # Serializar timestamps
     for r in rows:
         if r.get("cerrado_en"):
             r["cerrado_en"] = str(r["cerrado_en"])
@@ -1535,17 +1479,26 @@ def listar_cierres():
 
 @app.get("/cierres-mes/informe")
 def informe_cierre(anio: int = Query(...), mes: int = Query(...)):
-    """Retorna datos completos del informe de cierre para generar PDF/Excel en frontend."""
+    """
+    Retorna datos completos del informe de cierre para generar PDF/Excel en frontend.
+    FIX v2.9.1: _calcular_resumen_mes ya no rompe la transacción.
+    """
     if not (DATA_MODE == "db" and pool):
         raise HTTPException(503, "DB no disponible")
     conn = db_conn(); cur = conn.cursor()
-    data = _calcular_resumen_mes(cur, anio, mes)
 
-    # Verificar si está cerrado
-    cur.execute("SELECT estado, cerrado_en FROM cierres_mes WHERE anio=%s AND mes=%s", (anio, mes))
-    cierre = cur.fetchone()
-    data["cerrado"] = cierre[0] == "cerrado" if cierre else False
-    data["cerrado_en"] = str(cierre[1]) if cierre and cierre[1] else None
+    try:
+        data = _calcular_resumen_mes(cur, anio, mes)
 
-    cur.close(); db_put(conn)
-    return data
+        cur.execute("SELECT estado, cerrado_en FROM cierres_mes WHERE anio=%s AND mes=%s", (anio, mes))
+        cierre = cur.fetchone()
+        data["cerrado"] = cierre[0] == "cerrado" if cierre else False
+        data["cerrado_en"] = str(cierre[1]) if cierre and cierre[1] else None
+
+        cur.close(); db_put(conn)
+        return data
+
+    except Exception as e:
+        log.error(f"[INFORME CIERRE ERROR] anio={anio} mes={mes}: {e}")
+        cur.close(); db_put(conn)
+        raise HTTPException(500, f"Error al calcular informe: {str(e)}")
