@@ -899,6 +899,26 @@ def _init_db():
             )
         """)
 
+        # ── Tabla cierres_detalle ──
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS cierres_detalle (
+                id           SERIAL PRIMARY KEY,
+                cierre_id    INTEGER,
+                familia_id   INTEGER,
+                nombre       VARCHAR(200),
+                camion       VARCHAR(10),
+                litros       INTEGER,
+                personas     INTEGER,
+                entregas_mes INTEGER,
+                cobro        NUMERIC(10,2),
+                pagado       NUMERIC(10,2),
+                deuda        NUMERIC(10,2),
+                estado       VARCHAR(20),
+                anio         INTEGER,
+                mes          INTEGER
+            )
+        """)
+
         # ── Tabla cierres_mes ──
         cur.execute("""
             CREATE TABLE IF NOT EXISTS cierres_mes (
@@ -1330,21 +1350,19 @@ def _calcular_resumen_mes(cur, anio: int, mes: int) -> dict:
         cobro = n_entregas * personas * precio_unitario if precio_unitario > 0 else 0
         deuda_mes = max(0, cobro - float(pagado))
 
-        # Deuda acumulada (meses anteriores sin pagar)
-        cur.execute("""
-            SELECT COALESCE(SUM(cm.total_deuda_familia), 0)
-            FROM (
-                SELECT familia_id, deuda as total_deuda_familia
-                FROM cierres_detalle
-                WHERE familia_id = %s AND (anio < %s OR (anio = %s AND mes < %s))
-                AND deuda > 0
-            ) cm
-        """, (fid, anio, anio, mes))
-        # Si no existe tabla cierres_detalle aún, ignorar
+        # Deuda acumulada (meses anteriores cerrados con deuda)
+        deuda_acumulada = 0
         try:
-            deuda_acum_row = cur.fetchone()
-            deuda_acumulada = float(deuda_acum_row[0]) if deuda_acum_row else 0
-        except:
+            cur.execute(
+                "SELECT COALESCE(SUM(deuda),0) FROM cierres_detalle "
+                "WHERE familia_id=%s AND (anio<%s OR (anio=%s AND mes<%s)) AND deuda>0",
+                (fid, anio, anio, mes)
+            )
+            row_acum = cur.fetchone()
+            deuda_acumulada = float(row_acum[0]) if row_acum else 0
+        except Exception:
+            try: conn.rollback()
+            except: pass
             deuda_acumulada = 0
 
         # Residentes
