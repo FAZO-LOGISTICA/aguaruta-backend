@@ -19,6 +19,13 @@ try:
 except ImportError:
     HAS_PSYCOPG2 = False
 
+try:
+    import cloudinary
+    import cloudinary.uploader
+    HAS_CLOUDINARY = True
+except ImportError:
+    HAS_CLOUDINARY = False
+
 # ============================================================================
 # CONFIG
 # ============================================================================
@@ -29,6 +36,20 @@ EXCEL_FILE = DATA_DIR / "rutas_activas.xlsx"
 FOTOS_DIR = BASE_DIR / "fotos" / "evidencias"; FOTOS_DIR.mkdir(parents=True, exist_ok=True)
 
 DATA_MODE = os.getenv("DATA_MODE", "excel").lower().strip()
+
+# Cloudinary config
+CLOUDINARY_CLOUD = os.getenv("CLOUDINARY_CLOUD_NAME", "drhceyh7g")
+CLOUDINARY_KEY   = os.getenv("CLOUDINARY_API_KEY",    "984334546296218")
+CLOUDINARY_SECRET= os.getenv("CLOUDINARY_API_SECRET", "C0O23Y9Daty5HbAXgROG8_Bs0lw")
+CLOUDINARY_PRESET= os.getenv("CLOUDINARY_UPLOAD_PRESET", "aguaruta_fotos")
+
+if HAS_CLOUDINARY:
+    cloudinary.config(
+        cloud_name=CLOUDINARY_CLOUD,
+        api_key=CLOUDINARY_KEY,
+        api_secret=CLOUDINARY_SECRET,
+        secure=True
+    )
 DB_URL = os.getenv("DATABASE_URL")
 JWT_SECRET = os.getenv("JWT_SECRET", "aguaruta_super_secreto")
 JWT_EXP_MIN = int(os.getenv("JWT_EXP_MIN", "720"))
@@ -395,11 +416,31 @@ async def registrar_entregas(
 ):
     foto_url = None
     if foto and foto.filename:
-        fname = f"{uuid.uuid4().hex}.jpg"
-        dest = FOTOS_DIR / fname
-        with dest.open("wb") as f:
-            shutil.copyfileobj(foto.file, f)
-        foto_url = f"/fotos/{fname}"
+        if HAS_CLOUDINARY:
+            try:
+                resultado = cloudinary.uploader.upload(
+                    foto.file,
+                    folder="aguaruta/evidencias",
+                    public_id=f"entrega_{uuid.uuid4().hex}",
+                    resource_type="image",
+                    transformation=[{"width": 1200, "crop": "limit"}, {"quality": "auto"}]
+                )
+                foto_url = resultado.get("secure_url")
+                log.info(f"[CLOUDINARY] Foto subida: {foto_url}")
+            except Exception as e:
+                log.error(f"[CLOUDINARY ERROR] {e} — guardando en disco")
+                fname = f"{uuid.uuid4().hex}.jpg"
+                dest = FOTOS_DIR / fname
+                foto.file.seek(0)
+                with dest.open("wb") as f:
+                    shutil.copyfileobj(foto.file, f)
+                foto_url = f"/fotos/{fname}"
+        else:
+            fname = f"{uuid.uuid4().hex}.jpg"
+            dest = FOTOS_DIR / fname
+            with dest.open("wb") as f:
+                shutil.copyfileobj(foto.file, f)
+            foto_url = f"/fotos/{fname}"
 
     # Para estados 5 y 6 se guarda la cantidad real enviada
     # Para resto de estados no-entrega se guarda 0
