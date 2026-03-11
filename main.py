@@ -1,5 +1,5 @@
 # main.py — AguaRuta Backend
-# Versión: 2.7 — Entregas reales desde PostgreSQL en todos los endpoints
+# Versión: 2.9 — Módulo de Pagos: familias, residentes, historial
 
 import os, uuid, shutil, logging, hashlib, json, base64, hmac
 from datetime import datetime, timedelta
@@ -153,6 +153,24 @@ class NuevaEntrega(BaseModel):
     telefono: Optional[str] = None
     latitud: Optional[float] = None
     longitud: Optional[float] = None
+
+class PrecioMes(BaseModel):
+    anio: int
+    mes: int
+    precio_unitario: float  # precio por entrega de 700L
+
+class Residente(BaseModel):
+    nombre: str
+    rut: Optional[str] = None
+    observacion: Optional[str] = None
+
+class RegistrarPago(BaseModel):
+    jefe_id: int
+    anio: int
+    mes: int
+    monto: float
+    forma_pago: str  # efectivo / transferencia / otro
+    observacion: Optional[str] = None
 
 # ============================================================================
 # JWT
@@ -333,7 +351,7 @@ def generar_entregas_mock(desde: str = None, hasta: str = None) -> list:
 # ============================================================================
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "2.7", "data_mode": DATA_MODE,
+    return {"status": "ok", "version": "2.9", "data_mode": DATA_MODE,
             "excel_exists": EXCEL_FILE.exists(), "fallback_records": len(RUTAS_FALLBACK)}
 
 @app.get("/cors-test")
@@ -828,8 +846,81 @@ def _init_db():
             )
         """)
 
+        # ── Tabla familias (jefes de hogar) ──
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS familias (
+                id          SERIAL PRIMARY KEY,
+                ruta_id     INTEGER,
+                nombre      VARCHAR(200) NOT NULL,
+                camion      VARCHAR(10),
+                litros      INTEGER DEFAULT 700,
+                telefono    VARCHAR(50),
+                activo      BOOLEAN DEFAULT TRUE,
+                created_at  TIMESTAMP DEFAULT NOW()
+            )
+        """)
+
+        # ── Tabla residentes (miembros del grupo familiar) ──
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS residentes (
+                id          SERIAL PRIMARY KEY,
+                familia_id  INTEGER REFERENCES familias(id) ON DELETE CASCADE,
+                nombre      VARCHAR(200) NOT NULL,
+                rut         VARCHAR(20),
+                observacion TEXT,
+                created_at  TIMESTAMP DEFAULT NOW()
+            )
+        """)
+
+        # ── Tabla precios_mes ──
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS precios_mes (
+                id               SERIAL PRIMARY KEY,
+                anio             INTEGER NOT NULL,
+                mes              INTEGER NOT NULL,
+                precio_unitario  NUMERIC(10,2) NOT NULL,
+                created_at       TIMESTAMP DEFAULT NOW(),
+                UNIQUE(anio, mes)
+            )
+        """)
+
+        # ── Tabla pagos ──
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS pagos (
+                id          SERIAL PRIMARY KEY,
+                familia_id  INTEGER REFERENCES familias(id) ON DELETE CASCADE,
+                anio        INTEGER NOT NULL,
+                mes         INTEGER NOT NULL,
+                monto       NUMERIC(10,2) NOT NULL,
+                forma_pago  VARCHAR(50) DEFAULT 'efectivo',
+                observacion TEXT,
+                registrado_por VARCHAR(100),
+                created_at  TIMESTAMP DEFAULT NOW()
+            )
+        """)
+
+        # ── Tabla cierres_mes ──
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS cierres_mes (
+                id               SERIAL PRIMARY KEY,
+                anio             INTEGER NOT NULL,
+                mes              INTEGER NOT NULL,
+                cerrado_en       TIMESTAMP DEFAULT NOW(),
+                cerrado_por      VARCHAR(100),
+                precio_unitario  NUMERIC(10,2),
+                total_familias   INTEGER,
+                total_pagados    INTEGER,
+                total_morosos    INTEGER,
+                total_cobrado    NUMERIC(10,2),
+                total_pagado     NUMERIC(10,2),
+                total_deuda      NUMERIC(10,2),
+                estado           VARCHAR(20) DEFAULT 'cerrado',
+                UNIQUE(anio, mes)
+            )
+        """)
+
         conn.commit()
-        log.info("✅ Tablas creadas/verificadas en PostgreSQL (v2.7)")
+        log.info("✅ Tablas creadas/verificadas en PostgreSQL (v2.9)")
 
         # ── Sincronizar rutas_activas si está incompleta ──
         cur.execute("SELECT COUNT(*) FROM rutas_activas")
@@ -857,3 +948,524 @@ def _init_db():
 
     except Exception as e:
         log.error(f"❌ Error inicializando DB: {e}")
+
+# ============================================================================
+# ENDPOINTS — MÓDULO PAGOS v2.8
+# ============================================================================
+
+# ── FAMILIAS ──
+
+@app.get("/familias")
+def get_familias(camion: Optional[str] = Query(None), q: Optional[str] = Query(None)):
+    """Lista jefes de hogar, opcionalmente sincronizando desde rutas_activas."""
+    if not (DATA_MODE == "db" and pool):
+        raise HTTPException(503, "DB no disponible")
+    conn = db_conn(); cur = conn.cursor()
+
+    # Auto-sincronizar familias desde rutas_activas si están vacías
+    cur.execute("SELECT COUNT(*) FROM familias")
+    if cur.fetchone()[0] == 0:
+        cur.execute("SELECT id, camion, nombre, litros, telefono FROM rutas_activas")
+        rutas = cur.fetchall()
+        for r in rutas:
+            cur.execute("""
+                INSERT INTO familias (ruta_id, camion, nombre, litros, telefono)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT DO NOTHING
+            """, (r[0], r[1], r[2], r[3] or 700, r[4] or ""))
+        conn.commit()
+        log.info(f"✅ {len(rutas)} familias sincronizadas desde rutas_activas")
+
+    conditions = ["f.activo = TRUE"]
+    params = []
+    if camion:
+        conditions.append("f.camion = %s"); params.append(camion.upper())
+    if q:
+        conditions.append("f.nombre ILIKE %s"); params.append(f"%{q}%")
+
+    where = "WHERE " + " AND ".join(conditions)
+    cur.execute(f"""
+        SELECT f.id, f.nombre, f.camion, f.litros, f.telefono,
+               COUNT(r.id) as residentes
+        FROM familias f
+        LEFT JOIN residentes r ON r.familia_id = f.id
+        {where}
+        GROUP BY f.id, f.nombre, f.camion, f.litros, f.telefono
+        ORDER BY f.camion, f.nombre
+    """, params)
+    cols = ["id","nombre","camion","litros","telefono","residentes"]
+    rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+    cur.close(); db_put(conn)
+    return rows
+
+
+@app.get("/familias/{familia_id}")
+def get_familia(familia_id: int):
+    """Detalle de una familia con residentes y últimos pagos."""
+    if not (DATA_MODE == "db" and pool):
+        raise HTTPException(503, "DB no disponible")
+    conn = db_conn(); cur = conn.cursor()
+
+    cur.execute("""
+        SELECT id, nombre, camion, litros, telefono, ruta_id
+        FROM familias WHERE id = %s AND activo = TRUE
+    """, (familia_id,))
+    row = cur.fetchone()
+    if not row:
+        cur.close(); db_put(conn); raise HTTPException(404, "Familia no encontrada")
+
+    familia = dict(zip(["id","nombre","camion","litros","telefono","ruta_id"], row))
+    familia["personas"] = familia["litros"] // 700
+    familia["litros_extra"] = familia["litros"] % 700
+
+    # Residentes
+    cur.execute("""
+        SELECT id, nombre, rut, observacion
+        FROM residentes WHERE familia_id = %s ORDER BY id
+    """, (familia_id,))
+    familia["residentes"] = [dict(zip(["id","nombre","rut","observacion"], r)) for r in cur.fetchall()]
+
+    # Últimos 12 pagos
+    cur.execute("""
+        SELECT id, anio, mes, monto, forma_pago, observacion, created_at
+        FROM pagos WHERE familia_id = %s
+        ORDER BY anio DESC, mes DESC LIMIT 12
+    """, (familia_id,))
+    familia["pagos"] = [dict(zip(["id","anio","mes","monto","forma_pago","observacion","created_at"], r)) for r in cur.fetchall()]
+
+    cur.close(); db_put(conn)
+    return familia
+
+
+# ── RESIDENTES ──
+
+@app.post("/familias/{familia_id}/residentes")
+def agregar_residente(familia_id: int, residente: Residente):
+    if not (DATA_MODE == "db" and pool):
+        raise HTTPException(503, "DB no disponible")
+    conn = db_conn(); cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO residentes (familia_id, nombre, rut, observacion)
+        VALUES (%s, %s, %s, %s) RETURNING id
+    """, (familia_id, residente.nombre, residente.rut, residente.observacion))
+    new_id = cur.fetchone()[0]
+    conn.commit(); cur.close(); db_put(conn)
+    return {"status": "ok", "id": new_id}
+
+@app.put("/residentes/{residente_id}")
+def actualizar_residente(residente_id: int, residente: Residente):
+    if not (DATA_MODE == "db" and pool):
+        raise HTTPException(503, "DB no disponible")
+    conn = db_conn(); cur = conn.cursor()
+    cur.execute("""
+        UPDATE residentes SET nombre=%s, rut=%s, observacion=%s WHERE id=%s
+    """, (residente.nombre, residente.rut, residente.observacion, residente_id))
+    conn.commit(); cur.close(); db_put(conn)
+    return {"status": "ok"}
+
+@app.delete("/residentes/{residente_id}")
+def eliminar_residente(residente_id: int):
+    if not (DATA_MODE == "db" and pool):
+        raise HTTPException(503, "DB no disponible")
+    conn = db_conn(); cur = conn.cursor()
+    cur.execute("DELETE FROM residentes WHERE id = %s", (residente_id,))
+    conn.commit(); cur.close(); db_put(conn)
+    return {"status": "ok"}
+
+
+# ── PRECIOS ──
+
+@app.get("/precios-mes")
+def get_precios():
+    if not (DATA_MODE == "db" and pool):
+        raise HTTPException(503, "DB no disponible")
+    conn = db_conn(); cur = conn.cursor()
+    cur.execute("SELECT id, anio, mes, precio_unitario FROM precios_mes ORDER BY anio DESC, mes DESC")
+    rows = [dict(zip(["id","anio","mes","precio_unitario"], r)) for r in cur.fetchall()]
+    cur.close(); db_put(conn)
+    return rows
+
+@app.post("/precios-mes")
+def set_precio_mes(precio: PrecioMes):
+    if not (DATA_MODE == "db" and pool):
+        raise HTTPException(503, "DB no disponible")
+    conn = db_conn(); cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO precios_mes (anio, mes, precio_unitario)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (anio, mes) DO UPDATE SET precio_unitario = EXCLUDED.precio_unitario
+        RETURNING id
+    """, (precio.anio, precio.mes, precio.precio_unitario))
+    new_id = cur.fetchone()[0]
+    conn.commit(); cur.close(); db_put(conn)
+    return {"status": "ok", "id": new_id}
+
+
+# ── PAGOS ──
+
+@app.post("/pagos")
+def registrar_pago(pago: RegistrarPago):
+    if not (DATA_MODE == "db" and pool):
+        raise HTTPException(503, "DB no disponible")
+    conn = db_conn(); cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO pagos (familia_id, anio, mes, monto, forma_pago, observacion, registrado_por)
+        VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id
+    """, (pago.jefe_id, pago.anio, pago.mes, pago.monto,
+          pago.forma_pago, pago.observacion, "admin"))
+    new_id = cur.fetchone()[0]
+    conn.commit(); cur.close(); db_put(conn)
+    return {"status": "ok", "id": new_id}
+
+@app.delete("/pagos/{pago_id}")
+def eliminar_pago(pago_id: int):
+    if not (DATA_MODE == "db" and pool):
+        raise HTTPException(503, "DB no disponible")
+    conn = db_conn(); cur = conn.cursor()
+    cur.execute("DELETE FROM pagos WHERE id = %s", (pago_id,))
+    conn.commit(); cur.close(); db_put(conn)
+    return {"status": "ok"}
+
+
+# ── RESUMEN MENSUAL (pagados vs morosos) ──
+
+@app.get("/resumen-pagos")
+def resumen_pagos(
+    anio: int = Query(...),
+    mes: int = Query(...),
+    camion: Optional[str] = Query(None)
+):
+    if not (DATA_MODE == "db" and pool):
+        raise HTTPException(503, "DB no disponible")
+    conn = db_conn(); cur = conn.cursor()
+
+    # Precio del mes
+    cur.execute("SELECT precio_unitario FROM precios_mes WHERE anio=%s AND mes=%s", (anio, mes))
+    precio_row = cur.fetchone()
+    precio_unitario = float(precio_row[0]) if precio_row else 0
+
+    # Entregas del mes por familia
+    mes_str = f"{anio}-{mes:02d}"
+    conditions = ["e.fecha LIKE %s"]
+    params = [f"{mes_str}%"]
+    if camion:
+        conditions.append("e.camion = %s"); params.append(camion.upper())
+
+    cur.execute(f"""
+        SELECT e.nombre, e.camion, COUNT(*) as entregas, SUM(e.litros) as litros_total
+        FROM entregas e
+        WHERE {' AND '.join(conditions)} AND e.estado IN (1,5,6,7)
+        GROUP BY e.nombre, e.camion
+    """, params)
+    entregas_map = {}
+    for row in cur.fetchall():
+        entregas_map[row[0].strip().lower()] = {
+            "entregas": row[2], "litros_total": row[3] or 0
+        }
+
+    # Familias
+    fam_conditions = ["f.activo = TRUE"]
+    fam_params = []
+    if camion:
+        fam_conditions.append("f.camion = %s"); fam_params.append(camion.upper())
+
+    cur.execute(f"""
+        SELECT f.id, f.nombre, f.camion, f.litros,
+               COALESCE(SUM(p.monto), 0) as pagado
+        FROM familias f
+        LEFT JOIN pagos p ON p.familia_id = f.id AND p.anio = %s AND p.mes = %s
+        WHERE {' AND '.join(fam_conditions)}
+        GROUP BY f.id, f.nombre, f.camion, f.litros
+        ORDER BY f.camion, f.nombre
+    """, [anio, mes] + fam_params)
+
+    resultado = []
+    for row in cur.fetchall():
+        fid, nombre, cam, litros, pagado = row
+        personas = litros // 700
+        data_entrega = entregas_map.get(nombre.strip().lower(), {"entregas": 0, "litros_total": 0})
+        n_entregas = data_entrega["entregas"]
+        # Cobro = entregas × (litros/700) × precio_unitario
+        cobro_calculado = n_entregas * personas * precio_unitario if precio_unitario > 0 else 0
+        deuda = max(0, cobro_calculado - float(pagado))
+        resultado.append({
+            "id": fid,
+            "nombre": nombre,
+            "camion": cam,
+            "litros": litros,
+            "personas": personas,
+            "entregas_mes": n_entregas,
+            "cobro_calculado": round(cobro_calculado, 2),
+            "pagado": round(float(pagado), 2),
+            "deuda": round(deuda, 2),
+            "estado": "pagado" if deuda <= 0 and cobro_calculado > 0 else "moroso" if cobro_calculado > 0 else "sin_entregas"
+        })
+
+    cur.close(); db_put(conn)
+    total_cobrado = sum(r["cobro_calculado"] for r in resultado)
+    total_pagado = sum(r["pagado"] for r in resultado)
+    total_deuda = sum(r["deuda"] for r in resultado)
+    pagados = len([r for r in resultado if r["estado"] == "pagado"])
+    morosos = len([r for r in resultado if r["estado"] == "moroso"])
+
+    return {
+        "anio": anio, "mes": mes,
+        "precio_unitario": precio_unitario,
+        "familias": resultado,
+        "resumen": {
+            "total_familias": len(resultado),
+            "pagados": pagados,
+            "morosos": morosos,
+            "total_cobrado": round(total_cobrado, 2),
+            "total_pagado": round(total_pagado, 2),
+            "total_deuda": round(total_deuda, 2),
+        }
+    }
+
+# ============================================================================
+# ENDPOINTS — CIERRE DE MES v2.9
+# ============================================================================
+
+def _calcular_resumen_mes(cur, anio: int, mes: int) -> dict:
+    """Calcula el resumen completo de un mes para cierre o informe."""
+    mes_str = f"{anio}-{mes:02d}"
+
+    # Precio del mes
+    cur.execute("SELECT precio_unitario FROM precios_mes WHERE anio=%s AND mes=%s", (anio, mes))
+    precio_row = cur.fetchone()
+    precio_unitario = float(precio_row[0]) if precio_row else 0
+
+    # Entregas del mes
+    cur.execute("""
+        SELECT nombre, camion, COUNT(*) as entregas, SUM(litros) as litros_total
+        FROM entregas
+        WHERE fecha LIKE %s AND estado IN (1,5,6,7)
+        GROUP BY nombre, camion
+    """, (f"{mes_str}%",))
+    entregas_map = {}
+    for row in cur.fetchall():
+        entregas_map[row[0].strip().lower()] = {
+            "entregas": row[2], "litros_total": row[3] or 0, "camion": row[1]
+        }
+
+    # Familias con pagos del mes
+    cur.execute("""
+        SELECT f.id, f.nombre, f.camion, f.litros, f.telefono,
+               COALESCE(SUM(p.monto), 0) as pagado
+        FROM familias f
+        LEFT JOIN pagos p ON p.familia_id = f.id AND p.anio = %s AND p.mes = %s
+        WHERE f.activo = TRUE
+        GROUP BY f.id, f.nombre, f.camion, f.litros, f.telefono
+        ORDER BY f.camion, f.nombre
+    """, (anio, mes))
+
+    familias = []
+    for row in cur.fetchall():
+        fid, nombre, camion, litros, telefono, pagado = row
+        personas = litros // 700
+        data_e = entregas_map.get(nombre.strip().lower(), {"entregas": 0, "litros_total": 0})
+        n_entregas = data_e["entregas"]
+        cobro = n_entregas * personas * precio_unitario if precio_unitario > 0 else 0
+        deuda_mes = max(0, cobro - float(pagado))
+
+        # Deuda acumulada (meses anteriores sin pagar)
+        cur.execute("""
+            SELECT COALESCE(SUM(cm.total_deuda_familia), 0)
+            FROM (
+                SELECT familia_id, deuda as total_deuda_familia
+                FROM cierres_detalle
+                WHERE familia_id = %s AND (anio < %s OR (anio = %s AND mes < %s))
+                AND deuda > 0
+            ) cm
+        """, (fid, anio, anio, mes))
+        # Si no existe tabla cierres_detalle aún, ignorar
+        try:
+            deuda_acum_row = cur.fetchone()
+            deuda_acumulada = float(deuda_acum_row[0]) if deuda_acum_row else 0
+        except:
+            deuda_acumulada = 0
+
+        # Residentes
+        cur.execute("SELECT nombre, rut FROM residentes WHERE familia_id = %s ORDER BY id", (fid,))
+        residentes = [{"nombre": r[0], "rut": r[1] or ""} for r in cur.fetchall()]
+
+        # Coordenadas desde rutas_activas
+        cur.execute("SELECT latitud, longitud FROM rutas_activas WHERE nombre ILIKE %s LIMIT 1", (nombre,))
+        coord = cur.fetchone()
+        latitud = float(coord[0]) if coord and coord[0] else None
+        longitud = float(coord[1]) if coord and coord[1] else None
+
+        familias.append({
+            "id": fid,
+            "nombre": nombre,
+            "camion": camion,
+            "litros": litros,
+            "personas": personas,
+            "telefono": telefono or "",
+            "entregas_mes": n_entregas,
+            "cobro_calculado": round(cobro, 2),
+            "pagado": round(float(pagado), 2),
+            "deuda_mes": round(deuda_mes, 2),
+            "deuda_acumulada": round(deuda_acumulada, 2),
+            "deuda_total": round(deuda_mes + deuda_acumulada, 2),
+            "estado": "pagado" if deuda_mes <= 0 and cobro > 0 else "moroso" if cobro > 0 else "sin_entregas",
+            "residentes": residentes,
+            "latitud": latitud,
+            "longitud": longitud,
+        })
+
+    pagados = [f for f in familias if f["estado"] == "pagado"]
+    morosos = [f for f in familias if f["estado"] == "moroso"]
+
+    return {
+        "anio": anio, "mes": mes,
+        "precio_unitario": precio_unitario,
+        "familias": familias,
+        "pagados": pagados,
+        "morosos": morosos,
+        "resumen": {
+            "total_familias": len(familias),
+            "total_pagados": len(pagados),
+            "total_morosos": len(morosos),
+            "total_cobrado": round(sum(f["cobro_calculado"] for f in familias), 2),
+            "total_pagado": round(sum(f["pagado"] for f in familias), 2),
+            "total_deuda": round(sum(f["deuda_mes"] for f in familias), 2),
+        }
+    }
+
+
+@app.post("/cierres-mes")
+def cerrar_mes(anio: int = Query(...), mes: int = Query(...)):
+    """Cierra el mes — guarda snapshot del estado financiero."""
+    if not (DATA_MODE == "db" and pool):
+        raise HTTPException(503, "DB no disponible")
+    conn = db_conn(); cur = conn.cursor()
+
+    # Verificar si ya está cerrado
+    cur.execute("SELECT estado FROM cierres_mes WHERE anio=%s AND mes=%s", (anio, mes))
+    cierre_existente = cur.fetchone()
+    if cierre_existente and cierre_existente[0] == "cerrado":
+        cur.close(); db_put(conn)
+        raise HTTPException(400, f"El mes {mes}/{anio} ya está cerrado")
+
+    data = _calcular_resumen_mes(cur, anio, mes)
+    r = data["resumen"]
+
+    # Crear tabla cierres_detalle si no existe
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS cierres_detalle (
+            id           SERIAL PRIMARY KEY,
+            cierre_id    INTEGER,
+            familia_id   INTEGER,
+            nombre       VARCHAR(200),
+            camion       VARCHAR(10),
+            litros       INTEGER,
+            personas     INTEGER,
+            entregas_mes INTEGER,
+            cobro        NUMERIC(10,2),
+            pagado       NUMERIC(10,2),
+            deuda        NUMERIC(10,2),
+            estado       VARCHAR(20),
+            anio         INTEGER,
+            mes          INTEGER
+        )
+    """)
+
+    # Insertar o actualizar cierre
+    cur.execute("""
+        INSERT INTO cierres_mes
+            (anio, mes, cerrado_por, precio_unitario, total_familias,
+             total_pagados, total_morosos, total_cobrado, total_pagado, total_deuda, estado)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'cerrado')
+        ON CONFLICT (anio, mes) DO UPDATE SET
+            cerrado_en=NOW(), estado='cerrado',
+            precio_unitario=EXCLUDED.precio_unitario,
+            total_familias=EXCLUDED.total_familias,
+            total_pagados=EXCLUDED.total_pagados,
+            total_morosos=EXCLUDED.total_morosos,
+            total_cobrado=EXCLUDED.total_cobrado,
+            total_pagado=EXCLUDED.total_pagado,
+            total_deuda=EXCLUDED.total_deuda
+        RETURNING id
+    """, (anio, mes, "admin", data["precio_unitario"],
+          r["total_familias"], r["total_pagados"], r["total_morosos"],
+          r["total_cobrado"], r["total_pagado"], r["total_deuda"]))
+    cierre_id = cur.fetchone()[0]
+
+    # Limpiar detalle anterior si reabre
+    cur.execute("DELETE FROM cierres_detalle WHERE cierre_id=%s", (cierre_id,))
+
+    # Guardar detalle por familia
+    for f in data["familias"]:
+        cur.execute("""
+            INSERT INTO cierres_detalle
+                (cierre_id, familia_id, nombre, camion, litros, personas,
+                 entregas_mes, cobro, pagado, deuda, estado, anio, mes)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (cierre_id, f["id"], f["nombre"], f["camion"], f["litros"],
+              f["personas"], f["entregas_mes"], f["cobro_calculado"],
+              f["pagado"], f["deuda_mes"], f["estado"], anio, mes))
+
+    conn.commit(); cur.close(); db_put(conn)
+    log.info(f"[CIERRE] Mes {mes}/{anio} cerrado — {r['total_morosos']} morosos, deuda total ${r['total_deuda']}")
+    return {"status": "ok", "cierre_id": cierre_id, "resumen": r}
+
+
+@app.post("/cierres-mes/reabrir")
+def reabrir_mes(anio: int = Query(...), mes: int = Query(...)):
+    """Reabre un mes cerrado para correcciones."""
+    if not (DATA_MODE == "db" and pool):
+        raise HTTPException(503, "DB no disponible")
+    conn = db_conn(); cur = conn.cursor()
+    cur.execute(
+        "UPDATE cierres_mes SET estado='abierto', cerrado_en=NOW() WHERE anio=%s AND mes=%s",
+        (anio, mes)
+    )
+    if cur.rowcount == 0:
+        cur.close(); db_put(conn)
+        raise HTTPException(404, "Cierre no encontrado")
+    conn.commit(); cur.close(); db_put(conn)
+    log.info(f"[CIERRE] Mes {mes}/{anio} reabierto")
+    return {"status": "ok", "mensaje": f"Mes {mes}/{anio} reabierto correctamente"}
+
+
+@app.get("/cierres-mes")
+def listar_cierres():
+    """Lista todos los cierres registrados."""
+    if not (DATA_MODE == "db" and pool):
+        raise HTTPException(503, "DB no disponible")
+    conn = db_conn(); cur = conn.cursor()
+    cur.execute("""
+        SELECT id, anio, mes, estado, cerrado_en,
+               total_familias, total_pagados, total_morosos,
+               total_cobrado, total_pagado, total_deuda, precio_unitario
+        FROM cierres_mes ORDER BY anio DESC, mes DESC
+    """)
+    cols = ["id","anio","mes","estado","cerrado_en","total_familias",
+            "total_pagados","total_morosos","total_cobrado","total_pagado",
+            "total_deuda","precio_unitario"]
+    rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    # Serializar timestamps
+    for r in rows:
+        if r.get("cerrado_en"):
+            r["cerrado_en"] = str(r["cerrado_en"])
+    cur.close(); db_put(conn)
+    return rows
+
+
+@app.get("/cierres-mes/informe")
+def informe_cierre(anio: int = Query(...), mes: int = Query(...)):
+    """Retorna datos completos del informe de cierre para generar PDF/Excel en frontend."""
+    if not (DATA_MODE == "db" and pool):
+        raise HTTPException(503, "DB no disponible")
+    conn = db_conn(); cur = conn.cursor()
+    data = _calcular_resumen_mes(cur, anio, mes)
+
+    # Verificar si está cerrado
+    cur.execute("SELECT estado, cerrado_en FROM cierres_mes WHERE anio=%s AND mes=%s", (anio, mes))
+    cierre = cur.fetchone()
+    data["cerrado"] = cierre[0] == "cerrado" if cierre else False
+    data["cerrado_en"] = str(cierre[1]) if cierre and cierre[1] else None
+
+    cur.close(); db_put(conn)
+    return data
