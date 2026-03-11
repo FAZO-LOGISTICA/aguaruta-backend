@@ -1155,11 +1155,41 @@ def eliminar_pago(pago_id: int):
 def resumen_pagos(
     anio: int = Query(...),
     mes: int = Query(...),
-    camion: Optional[str] = Query(None)
+    camion: Optional[str] = Query(None),
+    dia: Optional[str] = Query(None)
 ):
     if not (DATA_MODE == "db" and pool):
         raise HTTPException(503, "DB no disponible")
     conn = db_conn(); cur = conn.cursor()
+
+    # Auto-sincronizar familias desde rutas_activas si estan vacias
+    cur.execute("SELECT COUNT(*) FROM familias")
+    if cur.fetchone()[0] == 0:
+        cur.execute("SELECT id, camion, nombre, litros, telefono FROM rutas_activas")
+        rutas_sync = cur.fetchall()
+        for r in rutas_sync:
+            cur.execute(
+                "INSERT INTO familias (ruta_id, camion, nombre, litros, telefono) VALUES (%s,%s,%s,%s,%s)",
+                (r[0], r[1], r[2], r[3] or 700, r[4] or "")
+            )
+        conn.commit()
+        log.info(f"[RESUMEN-PAGOS] {len(rutas_sync)} familias sincronizadas automaticamente")
+
+    # Si hay filtro de día: obtener los nombres que tienen ese día en rutas_activas
+    nombres_dia = None
+    if dia and camion:
+        cur.execute(
+            "SELECT DISTINCT nombre FROM rutas_activas WHERE UPPER(dia)=%s AND UPPER(camion)=%s",
+            (dia.upper(), camion.upper())
+        )
+        nombres_dia = {r[0].strip().lower() for r in cur.fetchall()}
+        log.info(f"[RESUMEN-PAGOS] dia={dia} camion={camion} → {len(nombres_dia)} personas")
+    elif dia:
+        cur.execute(
+            "SELECT DISTINCT nombre FROM rutas_activas WHERE UPPER(dia)=%s",
+            (dia.upper(),)
+        )
+        nombres_dia = {r[0].strip().lower() for r in cur.fetchall()}
 
     # Precio del mes
     cur.execute("SELECT precio_unitario FROM precios_mes WHERE anio=%s AND mes=%s", (anio, mes))
@@ -1204,6 +1234,11 @@ def resumen_pagos(
     resultado = []
     for row in cur.fetchall():
         fid, nombre, cam, litros, pagado = row
+
+        # Filtrar por día si corresponde
+        if nombres_dia is not None and nombre.strip().lower() not in nombres_dia:
+            continue
+
         personas = litros // 700
         data_entrega = entregas_map.get(nombre.strip().lower(), {"entregas": 0, "litros_total": 0})
         n_entregas = data_entrega["entregas"]
