@@ -1210,6 +1210,10 @@ def resumen_pagos(
         # Cobro = entregas × (litros/700) × precio_unitario
         cobro_calculado = n_entregas * personas * precio_unitario if precio_unitario > 0 else 0
         deuda = max(0, cobro_calculado - float(pagado))
+        # Días de entrega de esta familia
+        cur.execute("SELECT DISTINCT dia FROM rutas_activas WHERE nombre ILIKE %s", (nombre,))
+        dias_familia = [r[0].upper() for r in cur.fetchall() if r[0]]
+
         resultado.append({
             "id": fid,
             "nombre": nombre,
@@ -1220,7 +1224,8 @@ def resumen_pagos(
             "cobro_calculado": round(cobro_calculado, 2),
             "pagado": round(float(pagado), 2),
             "deuda": round(deuda, 2),
-            "estado": "pagado" if deuda <= 0 and cobro_calculado > 0 else "moroso" if cobro_calculado > 0 else "sin_entregas"
+            "estado": "pagado" if deuda <= 0 and cobro_calculado > 0 else "moroso" if cobro_calculado > 0 else "sin_entregas",
+            "_dias": dias_familia,
         })
 
     cur.close(); db_put(conn)
