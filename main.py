@@ -1254,79 +1254,88 @@ def resumen_pagos(
 def _calcular_resumen_mes(cur, anio: int, mes: int) -> dict:
     """
     Calcula el resumen completo de un mes para cierre o informe.
-    FIX v2.9.1: usa SAVEPOINT para la query de deuda acumulada,
-    evitando que un error aborte toda la transacción de PostgreSQL.
+    v2.9.2 OPTIMIZADO: 5 queries totales en vez de N*4 queries en loop.
+    Antes: ~3500 queries para 864 familias. Ahora: siempre 5.
     """
     mes_str = f"{anio}-{mes:02d}"
 
-    # Precio del mes
+    # ── 1. Precio del mes ────────────────────────────────────────────────────
     cur.execute("SELECT precio_unitario FROM precios_mes WHERE anio=%s AND mes=%s", (anio, mes))
     precio_row = cur.fetchone()
     precio_unitario = float(precio_row[0]) if precio_row else 0
 
-    # Entregas del mes
+    # ── 2. Entregas del mes — agrupadas por nombre (1 query total) ──────────
     cur.execute("""
-        SELECT nombre, camion, COUNT(*) as entregas, SUM(litros) as litros_total
+        SELECT nombre, COUNT(*) as entregas, SUM(litros) as litros_total
         FROM entregas
         WHERE fecha LIKE %s AND estado IN (1,5,6,7)
-        GROUP BY nombre, camion
+        GROUP BY nombre
     """, (f"{mes_str}%",))
-    entregas_map = {}
-    for row in cur.fetchall():
-        entregas_map[row[0].strip().lower()] = {
-            "entregas": row[2], "litros_total": row[3] or 0, "camion": row[1]
-        }
+    entregas_map = {
+        row[0].strip().lower(): {"entregas": row[1], "litros_total": row[2] or 0}
+        for row in cur.fetchall()
+    }
 
-    # Familias con pagos del mes
+    # ── 3. Familias + pagos del mes + coordenadas + residentes (1 query) ────
     cur.execute("""
-        SELECT f.id, f.nombre, f.camion, f.litros, f.telefono,
-               COALESCE(SUM(p.monto), 0) as pagado
+        SELECT
+            f.id, f.nombre, f.camion, f.litros, f.telefono,
+            COALESCE(SUM(p.monto), 0) as pagado,
+            ra.latitud, ra.longitud
         FROM familias f
         LEFT JOIN pagos p ON p.familia_id = f.id AND p.anio = %s AND p.mes = %s
+        LEFT JOIN LATERAL (
+            SELECT latitud, longitud
+            FROM rutas_activas
+            WHERE LOWER(nombre) = LOWER(f.nombre)
+            LIMIT 1
+        ) ra ON true
         WHERE f.activo = TRUE
-        GROUP BY f.id, f.nombre, f.camion, f.litros, f.telefono
+        GROUP BY f.id, f.nombre, f.camion, f.litros, f.telefono, ra.latitud, ra.longitud
         ORDER BY f.camion, f.nombre
     """, (anio, mes))
+    familias_raw = cur.fetchall()
 
+    # ── 4. Todos los residentes de una vez (1 query) ─────────────────────────
+    cur.execute("""
+        SELECT familia_id, nombre, rut
+        FROM residentes
+        ORDER BY familia_id, id
+    """)
+    residentes_map = {}
+    for r in cur.fetchall():
+        fid_r = r[0]
+        if fid_r not in residentes_map:
+            residentes_map[fid_r] = []
+        residentes_map[fid_r].append({"nombre": r[1], "rut": r[2] or ""})
+
+    # ── 5. Deuda acumulada de cierres anteriores (1 query, con fallback) ────
+    deuda_acumulada_map = {}
+    try:
+        cur.execute("SAVEPOINT sp_deuda_bulk")
+        cur.execute("""
+            SELECT familia_id, COALESCE(SUM(deuda), 0)
+            FROM cierres_detalle
+            WHERE (anio < %s OR (anio = %s AND mes < %s)) AND deuda > 0
+            GROUP BY familia_id
+        """, (anio, anio, mes))
+        for row in cur.fetchall():
+            deuda_acumulada_map[row[0]] = float(row[1])
+        cur.execute("RELEASE SAVEPOINT sp_deuda_bulk")
+    except Exception as e:
+        log.warning(f"[deuda_acumulada_bulk] cierres_detalle no disponible aún: {e}")
+        cur.execute("ROLLBACK TO SAVEPOINT sp_deuda_bulk")
+
+    # ── Armar resultado en Python (sin más queries) ──────────────────────────
     familias = []
-    for row in cur.fetchall():
-        fid, nombre, camion, litros, telefono, pagado = row
+    for row in familias_raw:
+        fid, nombre, camion, litros, telefono, pagado, latitud, longitud = row
         personas = litros // 700
         data_e = entregas_map.get(nombre.strip().lower(), {"entregas": 0, "litros_total": 0})
         n_entregas = data_e["entregas"]
         cobro = n_entregas * personas * precio_unitario if precio_unitario > 0 else 0
         deuda_mes = max(0, cobro - float(pagado))
-
-        # ── FIX: Deuda acumulada con SAVEPOINT ──────────────────────────────
-        # Si cierres_detalle no existe aún o no tiene datos, la query puede
-        # lanzar una excepción que aborta toda la transacción en PostgreSQL.
-        # El SAVEPOINT permite recuperarnos sin perder el contexto.
-        deuda_acumulada = 0
-        try:
-            cur.execute("SAVEPOINT sp_deuda")
-            cur.execute(
-                "SELECT COALESCE(SUM(deuda), 0) FROM cierres_detalle "
-                "WHERE familia_id = %s AND (anio < %s OR (anio = %s AND mes < %s)) AND deuda > 0",
-                (fid, anio, anio, mes)
-            )
-            row_acum = cur.fetchone()
-            deuda_acumulada = float(row_acum[0]) if row_acum else 0
-            cur.execute("RELEASE SAVEPOINT sp_deuda")
-        except Exception as e:
-            log.warning(f"[deuda_acumulada] familia_id={fid} — rollback savepoint: {e}")
-            cur.execute("ROLLBACK TO SAVEPOINT sp_deuda")
-            deuda_acumulada = 0
-        # ────────────────────────────────────────────────────────────────────
-
-        # Residentes
-        cur.execute("SELECT nombre, rut FROM residentes WHERE familia_id = %s ORDER BY id", (fid,))
-        residentes = [{"nombre": r[0], "rut": r[1] or ""} for r in cur.fetchall()]
-
-        # Coordenadas desde rutas_activas
-        cur.execute("SELECT latitud, longitud FROM rutas_activas WHERE nombre ILIKE %s LIMIT 1", (nombre,))
-        coord = cur.fetchone()
-        latitud = float(coord[0]) if coord and coord[0] else None
-        longitud = float(coord[1]) if coord and coord[1] else None
+        deuda_acumulada = deuda_acumulada_map.get(fid, 0)
 
         familias.append({
             "id": fid,
@@ -1342,9 +1351,9 @@ def _calcular_resumen_mes(cur, anio: int, mes: int) -> dict:
             "deuda_acumulada": round(deuda_acumulada, 2),
             "deuda_total": round(deuda_mes + deuda_acumulada, 2),
             "estado": "pagado" if deuda_mes <= 0 and cobro > 0 else "moroso" if cobro > 0 else "sin_entregas",
-            "residentes": residentes,
-            "latitud": latitud,
-            "longitud": longitud,
+            "residentes": residentes_map.get(fid, []),
+            "latitud": float(latitud) if latitud else None,
+            "longitud": float(longitud) if longitud else None,
         })
 
     pagados = [f for f in familias if f["estado"] == "pagado"]
