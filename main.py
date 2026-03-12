@@ -131,6 +131,7 @@ class NuevoPunto(BaseModel):
     dia: str
     litros: int
     telefono: Optional[str] = None
+    correo: Optional[str] = None
     latitud: Optional[float] = None
     longitud: Optional[float] = None
 
@@ -676,6 +677,23 @@ def get_rutas_activas(camion: Optional[str]=None, dia: Optional[str]=None, q: Op
 @app.post("/rutas-activas")
 def add_ruta_activa(nuevo: NuevoPunto):
     df = read_rutas_excel()
+    if DATA_MODE == "db" and pool:
+        try:
+            conn = db_conn(); cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO rutas_activas (camion, nombre, dia, litros, telefono, correo, latitud, longitud)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
+            """, (
+                nuevo.camion, nuevo.nombre, nuevo.dia, nuevo.litros,
+                nuevo.telefono, nuevo.correo, nuevo.latitud, nuevo.longitud
+            ))
+            new_id = cur.fetchone()[0]
+            conn.commit(); cur.close(); db_put(conn)
+            return {"status": "ok", "new_id": new_id}
+        except Exception as e:
+            log.error(f"[ADD RUTA DB ERROR] {e}")
+            raise HTTPException(500, f"Error al guardar: {e}")
+
     new_id = int(df["id"].max() + 1 if not df.empty and "id" in df.columns else 1)
     row = {"id": new_id, **nuevo.dict()}
     df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
