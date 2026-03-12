@@ -1,5 +1,5 @@
 # main.py — AguaRuta Backend
-# Versión: 2.9.1 — Fix cierre de mes: savepoint para deuda acumulada
+# Versión: 2.9.3 — Auto-sync familias ↔ rutas_activas en startup y endpoint manual
 
 import os, uuid, shutil, logging, hashlib, json, base64, hmac
 from datetime import datetime, timedelta
@@ -37,7 +37,6 @@ FOTOS_DIR = BASE_DIR / "fotos" / "evidencias"; FOTOS_DIR.mkdir(parents=True, exi
 
 DATA_MODE = os.getenv("DATA_MODE", "excel").lower().strip()
 
-# Cloudinary config
 CLOUDINARY_CLOUD = os.getenv("CLOUDINARY_CLOUD_NAME", "drhceyh7g")
 CLOUDINARY_KEY   = os.getenv("CLOUDINARY_API_KEY",    "984334546296218")
 CLOUDINARY_SECRET= os.getenv("CLOUDINARY_API_SECRET", "C0O23Y9Daty5HbAXgROG8_Bs0lw")
@@ -63,7 +62,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 log = logging.getLogger(APP_NAME)
 
 # ============================================================================
-# DATOS REALES HARDCODEADOS — Fallback indestructible para Render
+# DATOS FALLBACK
 # ============================================================================
 RUTAS_FALLBACK = [
     {'camion': 'A1', 'nombre': 'Ada vera', 'dia': 'VIERNES', 'litros': 1400, 'telefono': '999775337', 'latitud': -33.1228333333, 'longitud': -71.6529166667},
@@ -81,9 +80,6 @@ RUTAS_FALLBACK = [
     {'camion': 'A2', 'nombre': 'Ada Urzua', 'dia': 'MARTES', 'litros': 1400, 'telefono': '', 'latitud': -33.1404444444, 'longitud': -71.6761666667},
     {'camion': 'A2', 'nombre': 'Ana Cagliero', 'dia': 'VIERNES', 'litros': 2800, 'telefono': '', 'latitud': -33.1304722222, 'longitud': -71.6701944444},
     {'camion': 'A2', 'nombre': 'Carlos Vargas', 'dia': 'VIERNES', 'litros': 1400, 'telefono': '', 'latitud': -33.1304444444, 'longitud': -71.6707777778},
-    # NOTA: Este fallback es reducido intencionalmente.
-    # La DB PostgreSQL ya contiene los 864 registros completos.
-    # El fallback solo se usa si count < len(RUTAS_FALLBACK), lo que NO ocurrirá.
 ]
 
 # ============================================================================
@@ -107,7 +103,7 @@ def db_put(conn):
 # ============================================================================
 # APP + CORS
 # ============================================================================
-app = FastAPI(title=APP_NAME, version="2.9.1")
+app = FastAPI(title=APP_NAME, version="2.9.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -244,61 +240,75 @@ def read_rutas_db() -> pd.DataFrame:
     return pd.DataFrame(rows, columns=RUTAS_COLUMNS)
 
 # ============================================================================
+# HELPER — SINCRONIZAR FAMILIAS (reutilizable internamente)
+# ============================================================================
+def _sync_familias(cur, conn) -> int:
+    """
+    Inserta en familias los registros de rutas_activas que aún no existen.
+    Compara por nombre normalizado (lower + strip).
+    No toca ni borra registros existentes.
+    Retorna cantidad de familias nuevas agregadas.
+    """
+    cur.execute("SELECT LOWER(TRIM(nombre)) FROM familias WHERE activo = TRUE")
+    nombres_existentes = {row[0] for row in cur.fetchall()}
+
+    cur.execute("SELECT id, camion, nombre, litros, telefono FROM rutas_activas")
+    rutas = cur.fetchall()
+
+    nuevas = 0
+    for r in rutas:
+        ruta_id, camion, nombre, litros, telefono = r
+        if not nombre:
+            continue
+        if nombre.strip().lower() not in nombres_existentes:
+            cur.execute("""
+                INSERT INTO familias (ruta_id, camion, nombre, litros, telefono)
+                VALUES (%s, %s, %s, %s, %s)
+            """, (ruta_id, camion, nombre.strip(), litros or 700, telefono or ""))
+            nombres_existentes.add(nombre.strip().lower())
+            nuevas += 1
+
+    if nuevas > 0:
+        conn.commit()
+        log.info(f"[SYNC] {nuevas} familias nuevas agregadas desde rutas_activas")
+
+    return nuevas
+
+# ============================================================================
 # HELPER — LEER ENTREGAS REALES DESDE DB
 # ============================================================================
-def read_entregas_db(
-    desde=None, hasta=None, camion=None, estado=None,
-    fecha=None, limit=1000
-) -> list:
+def read_entregas_db(desde=None, hasta=None, camion=None, estado=None, fecha=None, limit=1000) -> list:
     if not (DATA_MODE == "db" and pool):
         return []
     try:
-        conn = db_conn()
-        cur = conn.cursor()
-        conditions = []
-        params = []
-
+        conn = db_conn(); cur = conn.cursor()
+        conditions = []; params = []
         if camion:
-            conditions.append("camion = %s")
-            params.append(camion.upper())
+            conditions.append("camion = %s"); params.append(camion.upper())
         if fecha:
-            conditions.append("fecha = %s")
-            params.append(fecha)
+            conditions.append("fecha = %s"); params.append(fecha)
         else:
-            if desde:
-                conditions.append("fecha >= %s")
-                params.append(desde)
-            if hasta:
-                conditions.append("fecha <= %s")
-                params.append(hasta)
+            if desde: conditions.append("fecha >= %s"); params.append(desde)
+            if hasta: conditions.append("fecha <= %s"); params.append(hasta)
         if estado is not None:
-            conditions.append("estado = %s")
-            params.append(estado)
-
+            conditions.append("estado = %s"); params.append(estado)
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         params.append(limit)
-
         cur.execute(f"""
             SELECT id, nombre, camion, litros, estado, fecha, motivo,
                    telefono, latitud, longitud, foto_url, fuente, registrado_en
-            FROM entregas
-            {where}
-            ORDER BY registrado_en DESC
-            LIMIT %s
+            FROM entregas {where} ORDER BY registrado_en DESC LIMIT %s
         """, params)
-
         cols = ["id","nombre","camion","litros","estado","fecha","motivo",
                 "telefono","latitud","longitud","foto_url","fuente","registrado_en"]
-        rows = cur.fetchall()
-        cur.close()
-        db_put(conn)
+        rows = cur.fetchall(); cur.close(); db_put(conn)
         return [dict(zip(cols, row)) for row in rows]
     except Exception as e:
         log.error(f"[read_entregas_db ERROR] {e}")
         return []
 
 # ============================================================================
-# MOCK CAMIONES Y ENTREGAS
+# MOCK
 # ============================================================================
 CAMIONES_MOCK = [
     {"id": "A1", "nombre": "Camión A1", "patente": "AA-BB-11", "activo": True,  "color": "#2563eb"},
@@ -312,46 +322,42 @@ CAMIONES_MOCK = [
 ]
 
 def generar_entregas_mock(desde: str = None, hasta: str = None) -> list:
-    import random
-    random.seed(42)
-    camiones = ["A1", "A2", "A3", "A4", "A5", "M1", "M2", "M3"]
+    import random; random.seed(42)
+    camiones = ["A1","A2","A3","A4","A5","M1","M2","M3"]
     nombres = ["Rosa Martínez","Juan Pérez","María González","Carlos Rodríguez",
                "Ana Silva","Pedro Muñoz","Carmen López","Luis Fernández"]
     if desde and hasta:
         try:
             d_desde = datetime.strptime(desde, "%Y-%m-%d")
             d_hasta = datetime.strptime(hasta, "%Y-%m-%d")
-        except:
-            d_desde = d_hasta = datetime.now()
-    else:
-        d_desde = d_hasta = datetime.now()
+        except: d_desde = d_hasta = datetime.now()
+    else: d_desde = d_hasta = datetime.now()
     delta = (d_hasta - d_desde).days + 1
     fechas = [(d_desde + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(delta)]
     entregas = []; id_counter = 1
     for fecha in fechas:
         for camion in camiones:
             for _ in range(random.randint(3, 8)):
-                estado = random.choice([1, 1, 1, 2, 3])
+                estado = random.choice([1,1,1,2,3])
                 entregas.append({
-                    "id": id_counter, "camion": camion,
-                    "nombre": random.choice(nombres),
+                    "id": id_counter, "camion": camion, "nombre": random.choice(nombres),
                     "litros": random.choice([500,1000,1500,2000]) if estado == 1 else 0,
                     "estado": estado, "fecha": fecha,
-                    "motivo": None if estado == 1 else "Sin moradores" if estado == 2 else "Dirección no existe",
+                    "motivo": None if estado==1 else "Sin moradores" if estado==2 else "Dirección no existe",
                     "telefono": f"+569{random.randint(10000000,99999999)}",
-                    "latitud": -33.05 + random.uniform(-0.05, 0.05),
-                    "longitud": -71.62 + random.uniform(-0.05, 0.05),
+                    "latitud": -33.05 + random.uniform(-0.05,0.05),
+                    "longitud": -71.62 + random.uniform(-0.05,0.05),
                     "foto_url": None, "fuente": "manual"
                 })
                 id_counter += 1
     return entregas
 
 # ============================================================================
-# ENDPOINTS — SALUD Y UTILIDADES
+# ENDPOINTS — SALUD
 # ============================================================================
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "2.9.1", "data_mode": DATA_MODE,
+    return {"status": "ok", "version": "2.9.3", "data_mode": DATA_MODE,
             "excel_exists": EXCEL_FILE.exists(), "fallback_records": len(RUTAS_FALLBACK)}
 
 @app.get("/cors-test")
@@ -367,191 +373,115 @@ def get_camiones(only_active: Optional[bool] = None):
     return c
 
 # ============================================================================
-# ENDPOINTS — ENTREGAS REALES
+# ENDPOINTS — ENTREGAS
 # ============================================================================
-
 @app.get("/entregas")
-def get_entregas(
-    desde: Optional[str] = Query(None),
-    hasta: Optional[str] = Query(None),
-    camion: Optional[str] = Query(None),
-    estado: Optional[int] = Query(None)
-):
+def get_entregas(desde: Optional[str]=Query(None), hasta: Optional[str]=Query(None),
+                 camion: Optional[str]=Query(None), estado: Optional[int]=Query(None)):
     if not desde: desde = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
     if not hasta: hasta = datetime.now().strftime("%Y-%m-%d")
     if DATA_MODE == "db" and pool:
         rows = read_entregas_db(desde=desde, hasta=hasta, camion=camion, estado=estado)
-        if rows is not None:
-            return rows
+        if rows is not None: return rows
     e = generar_entregas_mock(desde, hasta)
     if camion: e = [x for x in e if x["camion"] == camion.upper()]
     if estado is not None: e = [x for x in e if x["estado"] == estado]
     return e
 
-
 @app.get("/entregas-todas")
-def get_entregas_todas(
-    desde: Optional[str] = Query(None),
-    hasta: Optional[str] = Query(None),
-    camion: Optional[str] = Query(None),
-    estado: Optional[int] = Query(None)
-):
+def get_entregas_todas(desde: Optional[str]=Query(None), hasta: Optional[str]=Query(None),
+                       camion: Optional[str]=Query(None), estado: Optional[int]=Query(None)):
     if not desde: desde = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
     if not hasta: hasta = datetime.now().strftime("%Y-%m-%d")
     if DATA_MODE == "db" and pool:
         rows = read_entregas_db(desde=desde, hasta=hasta, camion=camion, estado=estado, limit=2000)
-        if rows is not None:
-            return rows
+        if rows is not None: return rows
     e = generar_entregas_mock(desde, hasta)
     if camion: e = [x for x in e if x["camion"] == camion.upper()]
     if estado is not None: e = [x for x in e if x["estado"] == estado]
     return e
 
-
-# ============================================================================
-# ENDPOINT — REGISTRAR ENTREGA (desde app móvil repartidor)
-# ============================================================================
 @app.post("/registrar-entregas")
 async def registrar_entregas(
-    nombre: str = Form(...),
-    camion: str = Form(...),
-    litros: int = Form(...),
-    estado: int = Form(...),
-    fecha: str = Form(...),
-    motivo: Optional[str] = Form(None),
-    telefono: Optional[str] = Form(None),
-    latitud: Optional[float] = Form(None),
-    longitud: Optional[float] = Form(None),
-    foto: Optional[UploadFile] = File(None)
+    nombre: str = Form(...), camion: str = Form(...), litros: int = Form(...),
+    estado: int = Form(...), fecha: str = Form(...), motivo: Optional[str] = Form(None),
+    telefono: Optional[str] = Form(None), latitud: Optional[float] = Form(None),
+    longitud: Optional[float] = Form(None), foto: Optional[UploadFile] = File(None)
 ):
     foto_url = None
     if foto and foto.filename:
         if HAS_CLOUDINARY:
             try:
                 resultado = cloudinary.uploader.upload(
-                    foto.file,
-                    folder="aguaruta/evidencias",
-                    public_id=f"entrega_{uuid.uuid4().hex}",
-                    resource_type="image",
+                    foto.file, folder="aguaruta/evidencias",
+                    public_id=f"entrega_{uuid.uuid4().hex}", resource_type="image",
                     transformation=[{"width": 1200, "crop": "limit"}, {"quality": "auto"}]
                 )
                 foto_url = resultado.get("secure_url")
-                log.info(f"[CLOUDINARY] Foto subida: {foto_url}")
             except Exception as e:
-                log.error(f"[CLOUDINARY ERROR] {e} — guardando en disco")
-                fname = f"{uuid.uuid4().hex}.jpg"
-                dest = FOTOS_DIR / fname
+                log.error(f"[CLOUDINARY ERROR] {e}")
+                fname = f"{uuid.uuid4().hex}.jpg"; dest = FOTOS_DIR / fname
                 foto.file.seek(0)
-                with dest.open("wb") as f:
-                    shutil.copyfileobj(foto.file, f)
+                with dest.open("wb") as f: shutil.copyfileobj(foto.file, f)
                 foto_url = f"/fotos/{fname}"
         else:
-            fname = f"{uuid.uuid4().hex}.jpg"
-            dest = FOTOS_DIR / fname
-            with dest.open("wb") as f:
-                shutil.copyfileobj(foto.file, f)
+            fname = f"{uuid.uuid4().hex}.jpg"; dest = FOTOS_DIR / fname
+            with dest.open("wb") as f: shutil.copyfileobj(foto.file, f)
             foto_url = f"/fotos/{fname}"
 
-    litros_real = litros if estado in [1, 5, 6, 7] else 0
+    litros_real = litros if estado in [1,5,6,7] else 0
     registrado_en = datetime.utcnow().isoformat()
-
-    nueva = {
-        "nombre": nombre, "camion": camion, "litros": litros_real,
-        "estado": estado, "fecha": fecha, "motivo": motivo,
-        "telefono": telefono, "latitud": latitud, "longitud": longitud,
-        "foto_url": foto_url, "fuente": "movil", "registrado_en": registrado_en
-    }
+    nueva = {"nombre": nombre, "camion": camion, "litros": litros_real, "estado": estado,
+             "fecha": fecha, "motivo": motivo, "telefono": telefono, "latitud": latitud,
+             "longitud": longitud, "foto_url": foto_url, "fuente": "movil", "registrado_en": registrado_en}
 
     if DATA_MODE == "db" and pool:
         try:
-            conn = db_conn()
-            cur = conn.cursor()
+            conn = db_conn(); cur = conn.cursor()
             cur.execute("""
-                INSERT INTO entregas
-                    (nombre, camion, litros, estado, fecha, motivo,
+                INSERT INTO entregas (nombre, camion, litros, estado, fecha, motivo,
                      telefono, latitud, longitud, foto_url, fuente, registrado_en)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING id
-            """, (
-                nombre, camion.upper(), litros_real, estado, fecha, motivo,
-                telefono, latitud, longitud, foto_url, "movil", registrado_en
-            ))
-            new_id = cur.fetchone()[0]
-            conn.commit()
-            cur.close()
-            db_put(conn)
-            nueva["id"] = new_id
-            log.info(f"[ENTREGA DB] id={new_id} camion={camion} nombre={nombre} estado={estado}")
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
+            """, (nombre, camion.upper(), litros_real, estado, fecha, motivo,
+                  telefono, latitud, longitud, foto_url, "movil", registrado_en))
+            nueva["id"] = cur.fetchone()[0]
+            conn.commit(); cur.close(); db_put(conn)
         except Exception as e:
             log.error(f"[ENTREGA DB ERROR] {e}")
-            nueva["id"] = int(datetime.now().timestamp())
-            nueva["db_error"] = str(e)
+            nueva["id"] = int(datetime.now().timestamp()); nueva["db_error"] = str(e)
     else:
         nueva["id"] = int(datetime.now().timestamp())
-        log.info(f"[ENTREGA MOCK] camion={camion} nombre={nombre} estado={estado}")
 
     audit_log("sistema", "registrar_entrega", {"camion": camion, "nombre": nombre, "estado": estado})
     return {"status": "ok", "entrega": nueva}
 
-
-# ============================================================================
-# ENDPOINT — VER ENTREGAS REALES (para admin — EntregasApp.js)
-# ============================================================================
 @app.get("/entregas-app")
-def get_entregas_app(
-    camion: Optional[str] = Query(None),
-    fecha: Optional[str] = Query(None),
-    desde: Optional[str] = Query(None),
-    hasta: Optional[str] = Query(None),
-    estado: Optional[int] = Query(None),
-    limit: int = Query(500)
-):
+def get_entregas_app(camion: Optional[str]=Query(None), fecha: Optional[str]=Query(None),
+                     desde: Optional[str]=Query(None), hasta: Optional[str]=Query(None),
+                     estado: Optional[int]=Query(None), limit: int=Query(500)):
     if DATA_MODE == "db" and pool:
         try:
-            conn = db_conn()
-            cur = conn.cursor()
-            conditions = []
-            params = []
-
-            if camion:
-                conditions.append("camion = %s")
-                params.append(camion.upper())
-            if fecha:
-                conditions.append("fecha = %s")
-                params.append(fecha)
+            conn = db_conn(); cur = conn.cursor()
+            conditions = []; params = []
+            if camion: conditions.append("camion = %s"); params.append(camion.upper())
+            if fecha: conditions.append("fecha = %s"); params.append(fecha)
             else:
-                if desde:
-                    conditions.append("fecha >= %s")
-                    params.append(desde)
-                if hasta:
-                    conditions.append("fecha <= %s")
-                    params.append(hasta)
-            if estado is not None:
-                conditions.append("estado = %s")
-                params.append(estado)
-
+                if desde: conditions.append("fecha >= %s"); params.append(desde)
+                if hasta: conditions.append("fecha <= %s"); params.append(hasta)
+            if estado is not None: conditions.append("estado = %s"); params.append(estado)
             where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
             params.append(limit)
-
             cur.execute(f"""
                 SELECT id, nombre, camion, litros, estado, fecha, motivo,
                        telefono, latitud, longitud, foto_url, fuente, registrado_en
-                FROM entregas
-                {where}
-                ORDER BY registrado_en DESC
-                LIMIT %s
+                FROM entregas {where} ORDER BY registrado_en DESC LIMIT %s
             """, params)
-
             cols = ["id","nombre","camion","litros","estado","fecha","motivo",
                     "telefono","latitud","longitud","foto_url","fuente","registrado_en"]
-            rows = cur.fetchall()
-            cur.close()
-            db_put(conn)
+            rows = cur.fetchall(); cur.close(); db_put(conn)
             return [dict(zip(cols, row)) for row in rows]
-
         except Exception as e:
             log.error(f"[ENTREGAS-APP DB ERROR] {e}")
-
     if not desde: desde = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
     if not hasta: hasta = datetime.now().strftime("%Y-%m-%d")
     e = generar_entregas_mock(desde, hasta)
@@ -560,33 +490,20 @@ def get_entregas_app(
     if estado is not None: e = [x for x in e if x["estado"] == estado]
     return e[:limit]
 
-
-# ============================================================================
-# ENDPOINT — REGISTRAR ENTREGA JSON (modo manual/admin)
-# ============================================================================
 @app.post("/entregas")
 def registrar_entrega_json(entrega: NuevaEntrega):
-    nueva = entrega.dict()
-    nueva["fuente"] = "manual"
-    nueva["foto_url"] = None
+    nueva = entrega.dict(); nueva["fuente"] = "manual"; nueva["foto_url"] = None
     nueva["registrado_en"] = datetime.utcnow().isoformat()
-
     if DATA_MODE == "db" and pool:
         try:
-            conn = db_conn()
-            cur = conn.cursor()
+            conn = db_conn(); cur = conn.cursor()
             cur.execute("""
-                INSERT INTO entregas
-                    (nombre, camion, litros, estado, fecha, motivo,
+                INSERT INTO entregas (nombre, camion, litros, estado, fecha, motivo,
                      telefono, latitud, longitud, foto_url, fuente, registrado_en)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING id
-            """, (
-                nueva["nombre"], nueva["camion"].upper(), nueva["litros"],
-                nueva["estado"], nueva["fecha"], nueva.get("motivo"),
-                nueva.get("telefono"), nueva.get("latitud"), nueva.get("longitud"),
-                None, "manual", nueva["registrado_en"]
-            ))
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
+            """, (nueva["nombre"], nueva["camion"].upper(), nueva["litros"], nueva["estado"],
+                  nueva["fecha"], nueva.get("motivo"), nueva.get("telefono"),
+                  nueva.get("latitud"), nueva.get("longitud"), None, "manual", nueva["registrado_en"]))
             nueva["id"] = cur.fetchone()[0]
             conn.commit(); cur.close(); db_put(conn)
         except Exception as e:
@@ -594,73 +511,46 @@ def registrar_entrega_json(entrega: NuevaEntrega):
             nueva["id"] = int(datetime.now().timestamp())
     else:
         nueva["id"] = int(datetime.now().timestamp())
-
     return {"status": "ok", "entrega": nueva}
 
-
 # ============================================================================
-# ENDPOINTS — ESTADÍSTICAS Y NO-ENTREGADAS
+# ENDPOINTS — ESTADÍSTICAS
 # ============================================================================
-
 @app.get("/estadisticas-camion")
-def estadisticas_camion(
-    camion: Optional[str] = Query(None),
-    desde: Optional[str] = Query(None),
-    hasta: Optional[str] = Query(None)
-):
+def estadisticas_camion(camion: Optional[str]=Query(None), desde: Optional[str]=Query(None), hasta: Optional[str]=Query(None)):
     if not desde: desde = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
     if not hasta: hasta = datetime.now().strftime("%Y-%m-%d")
-
-    if DATA_MODE == "db" and pool:
-        rows = read_entregas_db(desde=desde, hasta=hasta, camion=camion, limit=5000)
-    else:
-        rows = []
-
+    rows = read_entregas_db(desde=desde, hasta=hasta, camion=camion, limit=5000) if DATA_MODE == "db" and pool else []
     if not rows:
         rows = generar_entregas_mock(desde, hasta)
         if camion: rows = [x for x in rows if x["camion"] == camion.upper()]
-
     stats = {}
     for x in rows:
         c = x["camion"]
-        if c not in stats:
-            stats[c] = {"camion": c, "total": 0, "entregadas": 0, "no_entregadas": 0, "litros_total": 0}
-        stats[c]["total"] += 1
-        stats[c]["litros_total"] += int(x.get("litros") or 0)
-        if int(x.get("estado", 0)) in [1, 5, 6, 7]:
-            stats[c]["entregadas"] += 1
-        else:
-            stats[c]["no_entregadas"] += 1
-
+        if c not in stats: stats[c] = {"camion":c,"total":0,"entregadas":0,"no_entregadas":0,"litros_total":0}
+        stats[c]["total"] += 1; stats[c]["litros_total"] += int(x.get("litros") or 0)
+        if int(x.get("estado",0)) in [1,5,6,7]: stats[c]["entregadas"] += 1
+        else: stats[c]["no_entregadas"] += 1
     for c in stats:
         t = stats[c]["total"]
-        stats[c]["porcentaje_entrega"] = round(stats[c]["entregadas"] / t * 100, 1) if t > 0 else 0
+        stats[c]["porcentaje_entrega"] = round(stats[c]["entregadas"]/t*100,1) if t>0 else 0
     return list(stats.values())
 
-
 @app.get("/no-entregadas")
-def get_no_entregadas(
-    desde: Optional[str] = Query(None),
-    hasta: Optional[str] = Query(None),
-    camion: Optional[str] = Query(None),
-    estado: Optional[int] = Query(None)
-):
+def get_no_entregadas(desde: Optional[str]=Query(None), hasta: Optional[str]=Query(None),
+                      camion: Optional[str]=Query(None), estado: Optional[int]=Query(None)):
     if not desde: desde = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
     if not hasta: hasta = datetime.now().strftime("%Y-%m-%d")
-
     if DATA_MODE == "db" and pool:
         rows = read_entregas_db(desde=desde, hasta=hasta, camion=camion, limit=2000)
         if rows is not None:
-            no_e = [x for x in rows if int(x.get("estado", 0)) not in [1, 5, 6, 7]]
-            if estado is not None:
-                no_e = [x for x in no_e if int(x.get("estado", 0)) == estado]
+            no_e = [x for x in rows if int(x.get("estado",0)) not in [1,5,6,7]]
+            if estado is not None: no_e = [x for x in no_e if int(x.get("estado",0)) == estado]
             return no_e
-
     e = [x for x in generar_entregas_mock(desde, hasta) if x["estado"] != 1]
     if camion: e = [x for x in e if x["camion"] == camion.upper()]
     if estado is not None: e = [x for x in e if x["estado"] == estado]
     return e
-
 
 # ============================================================================
 # ENDPOINTS — RUTAS ACTIVAS
@@ -676,24 +566,36 @@ def get_rutas_activas(camion: Optional[str]=None, dia: Optional[str]=None, q: Op
 
 @app.post("/rutas-activas")
 def add_ruta_activa(nuevo: NuevoPunto):
-    df = read_rutas_excel()
     if DATA_MODE == "db" and pool:
         try:
             conn = db_conn(); cur = conn.cursor()
+            # 1. Insertar en rutas_activas
             cur.execute("""
                 INSERT INTO rutas_activas (camion, nombre, dia, litros, telefono, correo, latitud, longitud)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
-            """, (
-                nuevo.camion, nuevo.nombre, nuevo.dia, nuevo.litros,
-                nuevo.telefono, nuevo.correo, nuevo.latitud, nuevo.longitud
-            ))
+            """, (nuevo.camion, nuevo.nombre, nuevo.dia, nuevo.litros,
+                  nuevo.telefono, nuevo.correo, nuevo.latitud, nuevo.longitud))
             new_id = cur.fetchone()[0]
-            conn.commit(); cur.close(); db_put(conn)
+            conn.commit()
+
+            # 2. ✅ AUTO-SYNC: insertar también en familias si no existe
+            cur.execute("SELECT LOWER(TRIM(nombre)) FROM familias WHERE activo = TRUE")
+            nombres_existentes = {row[0] for row in cur.fetchall()}
+            if nuevo.nombre.strip().lower() not in nombres_existentes:
+                cur.execute("""
+                    INSERT INTO familias (ruta_id, camion, nombre, litros, telefono)
+                    VALUES (%s, %s, %s, %s, %s)
+                """, (new_id, nuevo.camion, nuevo.nombre.strip(), nuevo.litros or 700, nuevo.telefono or ""))
+                conn.commit()
+                log.info(f"[ADD RUTA] '{nuevo.nombre}' agregado también a familias automáticamente")
+
+            cur.close(); db_put(conn)
             return {"status": "ok", "new_id": new_id}
         except Exception as e:
             log.error(f"[ADD RUTA DB ERROR] {e}")
             raise HTTPException(500, f"Error al guardar: {e}")
 
+    df = read_rutas_excel()
     new_id = int(df["id"].max() + 1 if not df.empty and "id" in df.columns else 1)
     row = {"id": new_id, **nuevo.dict()}
     df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
@@ -703,11 +605,10 @@ def add_ruta_activa(nuevo: NuevoPunto):
 @app.put("/rutas-activas/{id}")
 def update_ruta_activa(id: int, cambios: dict):
     if DATA_MODE == "db" and pool:
-        campos_validos = ["camion", "nombre", "dia", "litros", "telefono", "correo", "latitud", "longitud"]
+        campos_validos = ["camion","nombre","dia","litros","telefono","correo","latitud","longitud"]
         sets = []; vals = []
         for key, val in cambios.items():
-            if key in campos_validos:
-                sets.append(f"{key} = %s"); vals.append(val)
+            if key in campos_validos: sets.append(f"{key} = %s"); vals.append(val)
         if not sets: raise HTTPException(400, "Sin campos válidos para actualizar")
         vals.append(id)
         conn = db_conn(); cur = conn.cursor()
@@ -717,19 +618,16 @@ def update_ruta_activa(id: int, cambios: dict):
             raise HTTPException(404, f"Registro {id} no encontrado")
         conn.commit()
         cur.execute("SELECT id,camion,nombre,dia,litros,telefono,latitud,longitud FROM rutas_activas WHERE id=%s", (id,))
-        row = cur.fetchone()
-        cur.close(); db_put(conn)
+        row = cur.fetchone(); cur.close(); db_put(conn)
         return {"status": "ok", "registro": dict(zip(RUTAS_COLUMNS, row))}
     else:
         df = read_rutas_excel()
         if "id" not in df.columns or id not in df["id"].values:
             raise HTTPException(404, f"Registro {id} no encontrado")
         for key, val in cambios.items():
-            if key in df.columns and key != "id":
-                df.loc[df["id"] == id, key] = val
+            if key in df.columns and key != "id": df.loc[df["id"] == id, key] = val
         write_rutas_excel(df)
-        fila = df[df["id"] == id].iloc[0].to_dict()
-        return {"status": "ok", "registro": fila}
+        return {"status": "ok", "registro": df[df["id"] == id].iloc[0].to_dict()}
 
 @app.delete("/rutas-activas/{id}")
 def delete_ruta_activa(id: int):
@@ -752,7 +650,7 @@ def delete_ruta_activa(id: int):
 def mapa_puntos():
     df = read_rutas_db() if DATA_MODE == "db" else read_rutas_excel()
     df = df[(df["latitud"].astype(float) != 0.0) & (df["longitud"].astype(float) != 0.0)]
-    df = df.dropna(subset=["latitud", "longitud"])
+    df = df.dropna(subset=["latitud","longitud"])
     df["color"] = df["camion"].apply(lambda c: CAMION_COLORS.get(str(c).upper(), "#1e40af"))
     df = df.replace([float("inf"), float("-inf")], None).fillna("")
     return df.to_dict(orient="records")
@@ -762,19 +660,16 @@ def mapa_puntos():
 # ============================================================================
 @app.post("/login")
 def login(creds: Credenciales):
-    usuario = creds.usuario.strip() or "admin"
-    rol = "admin"
+    usuario = creds.usuario.strip() or "admin"; rol = "admin"
     token = jwt_encode({"sub": usuario, "rol": rol})
-    audit_log(usuario, "login", {"rol": rol, "modo": "sin_usuarios"})
+    audit_log(usuario, "login", {"rol": rol})
     return {"token": token, "rol": rol}
 
 @app.get("/usuarios")
-def listar_usuarios():
-    return []
+def listar_usuarios(): return []
 
 @app.get("/auditoria")
-def auditoria_list():
-    return []
+def auditoria_list(): return []
 
 # ============================================================================
 # STARTUP + INIT DB
@@ -782,7 +677,7 @@ def auditoria_list():
 @app.on_event("startup")
 def startup():
     excel_ok = EXCEL_FILE.exists()
-    log.info(f"🚀 AguaRuta Backend v2.9.1 | DATA_MODE={DATA_MODE} | Excel={'✅' if excel_ok else '⚠️ FALLBACK'} | Rutas fallback={len(RUTAS_FALLBACK)}")
+    log.info(f"🚀 AguaRuta Backend v2.9.3 | DATA_MODE={DATA_MODE} | Excel={'✅' if excel_ok else '⚠️ FALLBACK'}")
     if DATA_MODE == "db" and pool:
         _init_db()
 
@@ -790,215 +685,151 @@ def _init_db():
     try:
         conn = db_conn(); cur = conn.cursor()
 
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS rutas_activas (
-                id        SERIAL PRIMARY KEY,
-                camion    VARCHAR(10),
-                nombre    VARCHAR(200),
-                dia       VARCHAR(20),
-                litros    INTEGER DEFAULT 0,
-                telefono  VARCHAR(50),
-                correo    VARCHAR(200),
-                latitud   DOUBLE PRECISION,
-                longitud  DOUBLE PRECISION
-            )
-        """)
-        # Para DBs ya existentes: agregar columna si no existe
+        cur.execute("""CREATE TABLE IF NOT EXISTS rutas_activas (
+            id SERIAL PRIMARY KEY, camion VARCHAR(10), nombre VARCHAR(200),
+            dia VARCHAR(20), litros INTEGER DEFAULT 0, telefono VARCHAR(50),
+            correo VARCHAR(200), latitud DOUBLE PRECISION, longitud DOUBLE PRECISION)""")
         cur.execute("ALTER TABLE rutas_activas ADD COLUMN IF NOT EXISTS correo VARCHAR(200)")
 
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS entregas (
-                id             SERIAL PRIMARY KEY,
-                nombre         VARCHAR(200),
-                camion         VARCHAR(10),
-                litros         INTEGER DEFAULT 0,
-                estado         INTEGER DEFAULT 1,
-                fecha          VARCHAR(20),
-                motivo         TEXT,
-                telefono       VARCHAR(50),
-                latitud        DOUBLE PRECISION,
-                longitud       DOUBLE PRECISION,
-                foto_url       TEXT,
-                fuente         VARCHAR(50) DEFAULT 'movil',
-                registrado_en  VARCHAR(50)
-            )
-        """)
+        cur.execute("""CREATE TABLE IF NOT EXISTS entregas (
+            id SERIAL PRIMARY KEY, nombre VARCHAR(200), camion VARCHAR(10),
+            litros INTEGER DEFAULT 0, estado INTEGER DEFAULT 1, fecha VARCHAR(20),
+            motivo TEXT, telefono VARCHAR(50), latitud DOUBLE PRECISION,
+            longitud DOUBLE PRECISION, foto_url TEXT, fuente VARCHAR(50) DEFAULT 'movil',
+            registrado_en VARCHAR(50))""")
 
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS auditoria (
-                id        SERIAL PRIMARY KEY,
-                usuario   VARCHAR(100),
-                accion    VARCHAR(100),
-                metadata  TEXT,
-                ts_utc    VARCHAR(50)
-            )
-        """)
+        cur.execute("""CREATE TABLE IF NOT EXISTS auditoria (
+            id SERIAL PRIMARY KEY, usuario VARCHAR(100), accion VARCHAR(100),
+            metadata TEXT, ts_utc VARCHAR(50))""")
 
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS usuarios (
-                id            SERIAL PRIMARY KEY,
-                usuario       VARCHAR(100) UNIQUE,
-                password_hash VARCHAR(200),
-                rol           VARCHAR(50),
-                active        BOOLEAN DEFAULT TRUE,
-                created_at    TIMESTAMP DEFAULT NOW()
-            )
-        """)
+        cur.execute("""CREATE TABLE IF NOT EXISTS usuarios (
+            id SERIAL PRIMARY KEY, usuario VARCHAR(100) UNIQUE,
+            password_hash VARCHAR(200), rol VARCHAR(50),
+            active BOOLEAN DEFAULT TRUE, created_at TIMESTAMP DEFAULT NOW())""")
 
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS familias (
-                id          SERIAL PRIMARY KEY,
-                ruta_id     INTEGER,
-                nombre      VARCHAR(200) NOT NULL,
-                camion      VARCHAR(10),
-                litros      INTEGER DEFAULT 700,
-                telefono    VARCHAR(50),
-                activo      BOOLEAN DEFAULT TRUE,
-                created_at  TIMESTAMP DEFAULT NOW()
-            )
-        """)
+        cur.execute("""CREATE TABLE IF NOT EXISTS familias (
+            id SERIAL PRIMARY KEY, ruta_id INTEGER, nombre VARCHAR(200) NOT NULL,
+            camion VARCHAR(10), litros INTEGER DEFAULT 700, telefono VARCHAR(50),
+            activo BOOLEAN DEFAULT TRUE, created_at TIMESTAMP DEFAULT NOW())""")
 
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS residentes (
-                id          SERIAL PRIMARY KEY,
-                familia_id  INTEGER REFERENCES familias(id) ON DELETE CASCADE,
-                nombre      VARCHAR(200) NOT NULL,
-                rut         VARCHAR(20),
-                observacion TEXT,
-                created_at  TIMESTAMP DEFAULT NOW()
-            )
-        """)
+        cur.execute("""CREATE TABLE IF NOT EXISTS residentes (
+            id SERIAL PRIMARY KEY, familia_id INTEGER REFERENCES familias(id) ON DELETE CASCADE,
+            nombre VARCHAR(200) NOT NULL, rut VARCHAR(20), observacion TEXT,
+            created_at TIMESTAMP DEFAULT NOW())""")
 
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS precios_mes (
-                id               SERIAL PRIMARY KEY,
-                anio             INTEGER NOT NULL,
-                mes              INTEGER NOT NULL,
-                precio_unitario  NUMERIC(10,2) NOT NULL,
-                created_at       TIMESTAMP DEFAULT NOW(),
-                UNIQUE(anio, mes)
-            )
-        """)
+        cur.execute("""CREATE TABLE IF NOT EXISTS precios_mes (
+            id SERIAL PRIMARY KEY, anio INTEGER NOT NULL, mes INTEGER NOT NULL,
+            precio_unitario NUMERIC(10,2) NOT NULL, created_at TIMESTAMP DEFAULT NOW(),
+            UNIQUE(anio, mes))""")
 
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS pagos (
-                id          SERIAL PRIMARY KEY,
-                familia_id  INTEGER REFERENCES familias(id) ON DELETE CASCADE,
-                anio        INTEGER NOT NULL,
-                mes         INTEGER NOT NULL,
-                monto       NUMERIC(10,2) NOT NULL,
-                forma_pago  VARCHAR(50) DEFAULT 'efectivo',
-                observacion TEXT,
-                registrado_por VARCHAR(100),
-                created_at  TIMESTAMP DEFAULT NOW()
-            )
-        """)
+        cur.execute("""CREATE TABLE IF NOT EXISTS pagos (
+            id SERIAL PRIMARY KEY, familia_id INTEGER REFERENCES familias(id) ON DELETE CASCADE,
+            anio INTEGER NOT NULL, mes INTEGER NOT NULL, monto NUMERIC(10,2) NOT NULL,
+            forma_pago VARCHAR(50) DEFAULT 'efectivo', observacion TEXT,
+            registrado_por VARCHAR(100), created_at TIMESTAMP DEFAULT NOW())""")
 
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS cierres_detalle (
-                id           SERIAL PRIMARY KEY,
-                cierre_id    INTEGER,
-                familia_id   INTEGER,
-                nombre       VARCHAR(200),
-                camion       VARCHAR(10),
-                litros       INTEGER,
-                personas     INTEGER,
-                entregas_mes INTEGER,
-                cobro        NUMERIC(10,2),
-                pagado       NUMERIC(10,2),
-                deuda        NUMERIC(10,2),
-                estado       VARCHAR(20),
-                anio         INTEGER,
-                mes          INTEGER
-            )
-        """)
+        cur.execute("""CREATE TABLE IF NOT EXISTS cierres_detalle (
+            id SERIAL PRIMARY KEY, cierre_id INTEGER, familia_id INTEGER,
+            nombre VARCHAR(200), camion VARCHAR(10), litros INTEGER, personas INTEGER,
+            entregas_mes INTEGER, cobro NUMERIC(10,2), pagado NUMERIC(10,2),
+            deuda NUMERIC(10,2), estado VARCHAR(20), anio INTEGER, mes INTEGER)""")
 
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS cierres_mes (
-                id               SERIAL PRIMARY KEY,
-                anio             INTEGER NOT NULL,
-                mes              INTEGER NOT NULL,
-                cerrado_en       TIMESTAMP DEFAULT NOW(),
-                cerrado_por      VARCHAR(100),
-                precio_unitario  NUMERIC(10,2),
-                total_familias   INTEGER,
-                total_pagados    INTEGER,
-                total_morosos    INTEGER,
-                total_cobrado    NUMERIC(10,2),
-                total_pagado     NUMERIC(10,2),
-                total_deuda      NUMERIC(10,2),
-                estado           VARCHAR(20) DEFAULT 'cerrado',
-                UNIQUE(anio, mes)
-            )
-        """)
+        cur.execute("""CREATE TABLE IF NOT EXISTS cierres_mes (
+            id SERIAL PRIMARY KEY, anio INTEGER NOT NULL, mes INTEGER NOT NULL,
+            cerrado_en TIMESTAMP DEFAULT NOW(), cerrado_por VARCHAR(100),
+            precio_unitario NUMERIC(10,2), total_familias INTEGER, total_pagados INTEGER,
+            total_morosos INTEGER, total_cobrado NUMERIC(10,2), total_pagado NUMERIC(10,2),
+            total_deuda NUMERIC(10,2), estado VARCHAR(20) DEFAULT 'cerrado', UNIQUE(anio, mes))""")
 
         conn.commit()
-        log.info("✅ Tablas creadas/verificadas en PostgreSQL (v2.9.1)")
+        log.info("✅ Tablas creadas/verificadas (v2.9.3)")
 
+        # Cargar rutas_activas si está vacía
         cur.execute("SELECT COUNT(*) FROM rutas_activas")
         count = cur.fetchone()[0]
-
         if count < len(RUTAS_FALLBACK):
-            log.info(f"📦 DB tiene {count} registros, fallback tiene {len(RUTAS_FALLBACK)} — sincronizando...")
+            log.info(f"📦 Cargando fallback en rutas_activas ({count} → {len(RUTAS_FALLBACK)})")
             cur.execute("DELETE FROM rutas_activas")
             for r in RUTAS_FALLBACK:
-                cur.execute("""
-                    INSERT INTO rutas_activas (camion, nombre, dia, litros, telefono, latitud, longitud)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                """, (
-                    r.get("camion"), r.get("nombre"), r.get("dia"),
-                    r.get("litros", 0), r.get("telefono", ""),
-                    r.get("latitud"), r.get("longitud")
-                ))
+                cur.execute("""INSERT INTO rutas_activas (camion, nombre, dia, litros, telefono, latitud, longitud)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+                    (r.get("camion"), r.get("nombre"), r.get("dia"),
+                     r.get("litros",0), r.get("telefono",""), r.get("latitud"), r.get("longitud")))
             conn.commit()
-            log.info(f"✅ {len(RUTAS_FALLBACK)} registros cargados en PostgreSQL")
-        else:
-            log.info(f"✅ PostgreSQL ya tiene {count} registros en rutas_activas — no se toca nada")
 
-        cur.close()
-        db_put(conn)
+        # ✅ AUTO-SYNC: detectar rutas nuevas que no estén en familias
+        cur.execute("SELECT COUNT(*) FROM rutas_activas")
+        ruta_count = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM familias WHERE activo = TRUE")
+        fam_count = cur.fetchone()[0]
+
+        if ruta_count != fam_count:
+            log.info(f"🔄 Detectada diferencia: {ruta_count} rutas vs {fam_count} familias — sincronizando...")
+            nuevas = _sync_familias(cur, conn)
+            log.info(f"✅ Startup sync: {nuevas} familias nuevas agregadas")
+        else:
+            log.info(f"✅ Familias sincronizadas ({fam_count} registros)")
+
+        cur.close(); db_put(conn)
 
     except Exception as e:
         log.error(f"❌ Error inicializando DB: {e}")
 
 # ============================================================================
-# ENDPOINTS — MÓDULO PAGOS v2.9.1
+# ENDPOINT — SINCRONIZAR FAMILIAS MANUALMENTE
 # ============================================================================
-
-@app.get("/familias")
-def get_familias(camion: Optional[str] = Query(None), q: Optional[str] = Query(None)):
+@app.post("/familias/sincronizar")
+def sincronizar_familias():
+    """
+    Sincroniza familias desde rutas_activas.
+    Agrega las que faltan sin tocar las existentes.
+    Úsalo después de agregar nuevos puntos en Rutas Activas.
+    """
     if not (DATA_MODE == "db" and pool):
         raise HTTPException(503, "DB no disponible")
+
     conn = db_conn(); cur = conn.cursor()
 
+    cur.execute("SELECT COUNT(*) FROM rutas_activas")
+    total_rutas = cur.fetchone()[0]
+
+    nuevas = _sync_familias(cur, conn)
+
+    cur.execute("SELECT COUNT(*) FROM familias WHERE activo = TRUE")
+    total_familias = cur.fetchone()[0]
+
+    cur.close(); db_put(conn)
+    return {
+        "status": "ok",
+        "nuevas_familias": nuevas,
+        "total_rutas": total_rutas,
+        "total_familias": total_familias,
+        "mensaje": f"✅ {nuevas} familias nuevas sincronizadas" if nuevas > 0 else "✅ Todo ya estaba sincronizado"
+    }
+
+# ============================================================================
+# ENDPOINTS — MÓDULO PAGOS
+# ============================================================================
+@app.get("/familias")
+def get_familias(camion: Optional[str]=Query(None), q: Optional[str]=Query(None)):
+    if not (DATA_MODE == "db" and pool): raise HTTPException(503, "DB no disponible")
+    conn = db_conn(); cur = conn.cursor()
     cur.execute("SELECT COUNT(*) FROM familias")
     if cur.fetchone()[0] == 0:
         cur.execute("SELECT id, camion, nombre, litros, telefono FROM rutas_activas")
         rutas = cur.fetchall()
         for r in rutas:
-            cur.execute("""
-                INSERT INTO familias (ruta_id, camion, nombre, litros, telefono)
-                VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT DO NOTHING
-            """, (r[0], r[1], r[2], r[3] or 700, r[4] or ""))
+            cur.execute("INSERT INTO familias (ruta_id, camion, nombre, litros, telefono) VALUES (%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+                        (r[0], r[1], r[2], r[3] or 700, r[4] or ""))
         conn.commit()
-        log.info(f"✅ {len(rutas)} familias sincronizadas desde rutas_activas")
-
-    conditions = ["f.activo = TRUE"]
-    params = []
-    if camion:
-        conditions.append("f.camion = %s"); params.append(camion.upper())
-    if q:
-        conditions.append("f.nombre ILIKE %s"); params.append(f"%{q}%")
-
+    conditions = ["f.activo = TRUE"]; params = []
+    if camion: conditions.append("f.camion = %s"); params.append(camion.upper())
+    if q: conditions.append("f.nombre ILIKE %s"); params.append(f"%{q}%")
     where = "WHERE " + " AND ".join(conditions)
     cur.execute(f"""
-        SELECT f.id, f.nombre, f.camion, f.litros, f.telefono,
-               COUNT(r.id) as residentes
-        FROM familias f
-        LEFT JOIN residentes r ON r.familia_id = f.id
-        {where}
-        GROUP BY f.id, f.nombre, f.camion, f.litros, f.telefono
+        SELECT f.id, f.nombre, f.camion, f.litros, f.telefono, COUNT(r.id) as residentes
+        FROM familias f LEFT JOIN residentes r ON r.familia_id = f.id
+        {where} GROUP BY f.id, f.nombre, f.camion, f.litros, f.telefono
         ORDER BY f.camion, f.nombre
     """, params)
     cols = ["id","nombre","camion","litros","telefono","residentes"]
@@ -1006,101 +837,67 @@ def get_familias(camion: Optional[str] = Query(None), q: Optional[str] = Query(N
     cur.close(); db_put(conn)
     return rows
 
-
 @app.put("/familias/{familia_id}")
 def update_familia(familia_id: int, cambios: dict):
-    if not (DATA_MODE == "db" and pool):
-        raise HTTPException(503, "DB no disponible")
-    campos_validos = ["nombre", "camion", "litros", "telefono"]
+    if not (DATA_MODE == "db" and pool): raise HTTPException(503, "DB no disponible")
+    campos_validos = ["nombre","camion","litros","telefono"]
     sets = []; vals = []
     for key, val in cambios.items():
-        if key in campos_validos:
-            sets.append(f"{key} = %s"); vals.append(val)
-    if not sets:
-        raise HTTPException(400, "Sin campos válidos")
+        if key in campos_validos: sets.append(f"{key} = %s"); vals.append(val)
+    if not sets: raise HTTPException(400, "Sin campos válidos")
     vals.append(familia_id)
     conn = db_conn(); cur = conn.cursor()
     cur.execute(f"UPDATE familias SET {', '.join(sets)} WHERE id = %s AND activo = TRUE", vals)
-    if cur.rowcount == 0:
-        cur.close(); db_put(conn)
-        raise HTTPException(404, "Familia no encontrada")
+    if cur.rowcount == 0: cur.close(); db_put(conn); raise HTTPException(404, "Familia no encontrada")
     conn.commit(); cur.close(); db_put(conn)
     return {"status": "ok"}
 
-
 @app.get("/familias/{familia_id}")
 def get_familia(familia_id: int):
-    if not (DATA_MODE == "db" and pool):
-        raise HTTPException(503, "DB no disponible")
+    if not (DATA_MODE == "db" and pool): raise HTTPException(503, "DB no disponible")
     conn = db_conn(); cur = conn.cursor()
-
-    cur.execute("""
-        SELECT id, nombre, camion, litros, telefono, ruta_id
-        FROM familias WHERE id = %s AND activo = TRUE
-    """, (familia_id,))
+    cur.execute("SELECT id, nombre, camion, litros, telefono, ruta_id FROM familias WHERE id=%s AND activo=TRUE", (familia_id,))
     row = cur.fetchone()
-    if not row:
-        cur.close(); db_put(conn); raise HTTPException(404, "Familia no encontrada")
-
+    if not row: cur.close(); db_put(conn); raise HTTPException(404, "Familia no encontrada")
     familia = dict(zip(["id","nombre","camion","litros","telefono","ruta_id"], row))
     familia["personas"] = familia["litros"] // 700
     familia["litros_extra"] = familia["litros"] % 700
-
-    cur.execute("""
-        SELECT id, nombre, rut, observacion
-        FROM residentes WHERE familia_id = %s ORDER BY id
-    """, (familia_id,))
+    cur.execute("SELECT id, nombre, rut, observacion FROM residentes WHERE familia_id=%s ORDER BY id", (familia_id,))
     familia["residentes"] = [dict(zip(["id","nombre","rut","observacion"], r)) for r in cur.fetchall()]
-
-    cur.execute("""
-        SELECT id, anio, mes, monto, forma_pago, observacion, created_at
-        FROM pagos WHERE familia_id = %s
-        ORDER BY anio DESC, mes DESC LIMIT 12
-    """, (familia_id,))
+    cur.execute("SELECT id, anio, mes, monto, forma_pago, observacion, created_at FROM pagos WHERE familia_id=%s ORDER BY anio DESC, mes DESC LIMIT 12", (familia_id,))
     familia["pagos"] = [dict(zip(["id","anio","mes","monto","forma_pago","observacion","created_at"], r)) for r in cur.fetchall()]
-
     cur.close(); db_put(conn)
     return familia
 
-
 @app.post("/familias/{familia_id}/residentes")
 def agregar_residente(familia_id: int, residente: Residente):
-    if not (DATA_MODE == "db" and pool):
-        raise HTTPException(503, "DB no disponible")
+    if not (DATA_MODE == "db" and pool): raise HTTPException(503, "DB no disponible")
     conn = db_conn(); cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO residentes (familia_id, nombre, rut, observacion)
-        VALUES (%s, %s, %s, %s) RETURNING id
-    """, (familia_id, residente.nombre, residente.rut, residente.observacion))
-    new_id = cur.fetchone()[0]
-    conn.commit(); cur.close(); db_put(conn)
+    cur.execute("INSERT INTO residentes (familia_id, nombre, rut, observacion) VALUES (%s,%s,%s,%s) RETURNING id",
+                (familia_id, residente.nombre, residente.rut, residente.observacion))
+    new_id = cur.fetchone()[0]; conn.commit(); cur.close(); db_put(conn)
     return {"status": "ok", "id": new_id}
 
 @app.put("/residentes/{residente_id}")
 def actualizar_residente(residente_id: int, residente: Residente):
-    if not (DATA_MODE == "db" and pool):
-        raise HTTPException(503, "DB no disponible")
+    if not (DATA_MODE == "db" and pool): raise HTTPException(503, "DB no disponible")
     conn = db_conn(); cur = conn.cursor()
-    cur.execute("""
-        UPDATE residentes SET nombre=%s, rut=%s, observacion=%s WHERE id=%s
-    """, (residente.nombre, residente.rut, residente.observacion, residente_id))
+    cur.execute("UPDATE residentes SET nombre=%s, rut=%s, observacion=%s WHERE id=%s",
+                (residente.nombre, residente.rut, residente.observacion, residente_id))
     conn.commit(); cur.close(); db_put(conn)
     return {"status": "ok"}
 
 @app.delete("/residentes/{residente_id}")
 def eliminar_residente(residente_id: int):
-    if not (DATA_MODE == "db" and pool):
-        raise HTTPException(503, "DB no disponible")
+    if not (DATA_MODE == "db" and pool): raise HTTPException(503, "DB no disponible")
     conn = db_conn(); cur = conn.cursor()
-    cur.execute("DELETE FROM residentes WHERE id = %s", (residente_id,))
+    cur.execute("DELETE FROM residentes WHERE id=%s", (residente_id,))
     conn.commit(); cur.close(); db_put(conn)
     return {"status": "ok"}
 
-
 @app.get("/precios-mes")
 def get_precios():
-    if not (DATA_MODE == "db" and pool):
-        raise HTTPException(503, "DB no disponible")
+    if not (DATA_MODE == "db" and pool): raise HTTPException(503, "DB no disponible")
     conn = db_conn(); cur = conn.cursor()
     cur.execute("SELECT id, anio, mes, precio_unitario FROM precios_mes ORDER BY anio DESC, mes DESC")
     rows = [dict(zip(["id","anio","mes","precio_unitario"], r)) for r in cur.fetchall()]
@@ -1109,78 +906,53 @@ def get_precios():
 
 @app.post("/precios-mes")
 def set_precio_mes(precio: PrecioMes):
-    if not (DATA_MODE == "db" and pool):
-        raise HTTPException(503, "DB no disponible")
+    if not (DATA_MODE == "db" and pool): raise HTTPException(503, "DB no disponible")
     conn = db_conn(); cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO precios_mes (anio, mes, precio_unitario)
-        VALUES (%s, %s, %s)
-        ON CONFLICT (anio, mes) DO UPDATE SET precio_unitario = EXCLUDED.precio_unitario
-        RETURNING id
-    """, (precio.anio, precio.mes, precio.precio_unitario))
-    new_id = cur.fetchone()[0]
-    conn.commit(); cur.close(); db_put(conn)
+    cur.execute("""INSERT INTO precios_mes (anio, mes, precio_unitario) VALUES (%s,%s,%s)
+        ON CONFLICT (anio, mes) DO UPDATE SET precio_unitario = EXCLUDED.precio_unitario RETURNING id""",
+        (precio.anio, precio.mes, precio.precio_unitario))
+    new_id = cur.fetchone()[0]; conn.commit(); cur.close(); db_put(conn)
     return {"status": "ok", "id": new_id}
-
 
 @app.post("/pagos")
 def registrar_pago(pago: RegistrarPago):
-    if not (DATA_MODE == "db" and pool):
-        raise HTTPException(503, "DB no disponible")
+    if not (DATA_MODE == "db" and pool): raise HTTPException(503, "DB no disponible")
     conn = db_conn(); cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO pagos (familia_id, anio, mes, monto, forma_pago, observacion, registrado_por)
-        VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id
-    """, (pago.jefe_id, pago.anio, pago.mes, pago.monto,
-          pago.forma_pago, pago.observacion, "admin"))
-    new_id = cur.fetchone()[0]
-    conn.commit(); cur.close(); db_put(conn)
+    cur.execute("""INSERT INTO pagos (familia_id, anio, mes, monto, forma_pago, observacion, registrado_por)
+        VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+        (pago.jefe_id, pago.anio, pago.mes, pago.monto, pago.forma_pago, pago.observacion, "admin"))
+    new_id = cur.fetchone()[0]; conn.commit(); cur.close(); db_put(conn)
     return {"status": "ok", "id": new_id}
 
 @app.delete("/pagos/{pago_id}")
 def eliminar_pago(pago_id: int):
-    if not (DATA_MODE == "db" and pool):
-        raise HTTPException(503, "DB no disponible")
+    if not (DATA_MODE == "db" and pool): raise HTTPException(503, "DB no disponible")
     conn = db_conn(); cur = conn.cursor()
-    cur.execute("DELETE FROM pagos WHERE id = %s", (pago_id,))
+    cur.execute("DELETE FROM pagos WHERE id=%s", (pago_id,))
     conn.commit(); cur.close(); db_put(conn)
     return {"status": "ok"}
 
-
 @app.get("/resumen-pagos")
-def resumen_pagos(
-    anio: int = Query(...),
-    mes: int = Query(...),
-    camion: Optional[str] = Query(None),
-    dia: Optional[str] = Query(None)
-):
-    if not (DATA_MODE == "db" and pool):
-        raise HTTPException(503, "DB no disponible")
+def resumen_pagos(anio: int=Query(...), mes: int=Query(...),
+                  camion: Optional[str]=Query(None), dia: Optional[str]=Query(None)):
+    if not (DATA_MODE == "db" and pool): raise HTTPException(503, "DB no disponible")
     conn = db_conn(); cur = conn.cursor()
 
-    cur.execute("SELECT COUNT(*) FROM familias")
-    if cur.fetchone()[0] == 0:
-        cur.execute("SELECT id, camion, nombre, litros, telefono FROM rutas_activas")
-        rutas_sync = cur.fetchall()
-        for r in rutas_sync:
-            cur.execute(
-                "INSERT INTO familias (ruta_id, camion, nombre, litros, telefono) VALUES (%s,%s,%s,%s,%s)",
-                (r[0], r[1], r[2], r[3] or 700, r[4] or "")
-            )
-        conn.commit()
+    # Auto-sync si hay diferencia
+    cur.execute("SELECT COUNT(*) FROM rutas_activas")
+    ruta_count = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM familias WHERE activo = TRUE")
+    fam_count = cur.fetchone()[0]
+    if ruta_count != fam_count:
+        _sync_familias(cur, conn)
 
     nombres_dia = None
     if dia and camion:
-        cur.execute(
-            "SELECT DISTINCT nombre FROM rutas_activas WHERE UPPER(dia)=%s AND UPPER(camion)=%s",
-            (dia.upper(), camion.upper())
-        )
+        cur.execute("SELECT DISTINCT nombre FROM rutas_activas WHERE UPPER(dia)=%s AND UPPER(camion)=%s",
+                    (dia.upper(), camion.upper()))
         nombres_dia = {r[0].strip().lower() for r in cur.fetchall()}
     elif dia:
-        cur.execute(
-            "SELECT DISTINCT nombre FROM rutas_activas WHERE UPPER(dia)=%s",
-            (dia.upper(),)
-        )
+        cur.execute("SELECT DISTINCT nombre FROM rutas_activas WHERE UPPER(dia)=%s", (dia.upper(),))
         nombres_dia = {r[0].strip().lower() for r in cur.fetchall()}
 
     cur.execute("SELECT precio_unitario FROM precios_mes WHERE anio=%s AND mes=%s", (anio, mes))
@@ -1188,37 +960,20 @@ def resumen_pagos(
     precio_unitario = float(precio_row[0]) if precio_row else 0
 
     mes_str = f"{anio}-{mes:02d}"
-    conditions = ["e.fecha LIKE %s"]
-    params = [f"{mes_str}%"]
-    if camion:
-        conditions.append("e.camion = %s"); params.append(camion.upper())
+    conditions = ["e.fecha LIKE %s"]; params = [f"{mes_str}%"]
+    if camion: conditions.append("e.camion = %s"); params.append(camion.upper())
+    cur.execute(f"""SELECT e.nombre, e.camion, COUNT(*) as entregas, SUM(e.litros) as litros_total
+        FROM entregas e WHERE {' AND '.join(conditions)} AND e.estado IN (1,5,6,7)
+        GROUP BY e.nombre, e.camion""", params)
+    entregas_map = {row[0].strip().lower(): {"entregas": row[2], "litros_total": row[3] or 0}
+                    for row in cur.fetchall()}
 
-    cur.execute(f"""
-        SELECT e.nombre, e.camion, COUNT(*) as entregas, SUM(e.litros) as litros_total
-        FROM entregas e
-        WHERE {' AND '.join(conditions)} AND e.estado IN (1,5,6,7)
-        GROUP BY e.nombre, e.camion
-    """, params)
-    entregas_map = {}
-    for row in cur.fetchall():
-        entregas_map[row[0].strip().lower()] = {
-            "entregas": row[2], "litros_total": row[3] or 0
-        }
-
-    fam_conditions = ["f.activo = TRUE"]
-    fam_params = []
-    if camion:
-        fam_conditions.append("f.camion = %s"); fam_params.append(camion.upper())
-
-    cur.execute(f"""
-        SELECT f.id, f.nombre, f.camion, f.litros,
-               COALESCE(SUM(p.monto), 0) as pagado
-        FROM familias f
-        LEFT JOIN pagos p ON p.familia_id = f.id AND p.anio = %s AND p.mes = %s
-        WHERE {' AND '.join(fam_conditions)}
-        GROUP BY f.id, f.nombre, f.camion, f.litros
-        ORDER BY f.camion, f.nombre
-    """, [anio, mes] + fam_params)
+    fam_conditions = ["f.activo = TRUE"]; fam_params = []
+    if camion: fam_conditions.append("f.camion = %s"); fam_params.append(camion.upper())
+    cur.execute(f"""SELECT f.id, f.nombre, f.camion, f.litros, COALESCE(SUM(p.monto), 0) as pagado
+        FROM familias f LEFT JOIN pagos p ON p.familia_id = f.id AND p.anio = %s AND p.mes = %s
+        WHERE {' AND '.join(fam_conditions)} GROUP BY f.id, f.nombre, f.camion, f.litros
+        ORDER BY f.camion, f.nombre""", [anio, mes] + fam_params)
 
     resultado = []
     for row in cur.fetchall():
@@ -1226,90 +981,55 @@ def resumen_pagos(
         if nombres_dia is not None and nombre.strip().lower() not in nombres_dia:
             continue
         personas = litros // 700
-        data_entrega = entregas_map.get(nombre.strip().lower(), {"entregas": 0, "litros_total": 0})
-        n_entregas = data_entrega["entregas"]
-        cobro_calculado = n_entregas * personas * precio_unitario if precio_unitario > 0 else 0
-        deuda = max(0, cobro_calculado - float(pagado))
+        data_e = entregas_map.get(nombre.strip().lower(), {"entregas": 0, "litros_total": 0})
+        n_entregas = data_e["entregas"]
+        cobro = n_entregas * personas * precio_unitario if precio_unitario > 0 else 0
+        deuda = max(0, cobro - float(pagado))
         cur.execute("SELECT DISTINCT dia FROM rutas_activas WHERE nombre ILIKE %s", (nombre,))
         dias_familia = [r[0].upper() for r in cur.fetchall() if r[0]]
-
         resultado.append({
-            "id": fid,
-            "nombre": nombre,
-            "camion": cam,
-            "litros": litros,
-            "personas": personas,
-            "entregas_mes": n_entregas,
-            "cobro_calculado": round(cobro_calculado, 2),
-            "pagado": round(float(pagado), 2),
+            "id": fid, "nombre": nombre, "camion": cam, "litros": litros,
+            "personas": personas, "entregas_mes": n_entregas,
+            "cobro_calculado": round(cobro, 2), "pagado": round(float(pagado), 2),
             "deuda": round(deuda, 2),
-            "estado": "pagado" if deuda <= 0 and cobro_calculado > 0 else "moroso" if cobro_calculado > 0 else "sin_entregas",
+            "estado": "pagado" if deuda<=0 and cobro>0 else "moroso" if cobro>0 else "sin_entregas",
             "_dias": dias_familia,
         })
 
     cur.close(); db_put(conn)
-    total_cobrado = sum(r["cobro_calculado"] for r in resultado)
-    total_pagado = sum(r["pagado"] for r in resultado)
-    total_deuda = sum(r["deuda"] for r in resultado)
-    pagados = len([r for r in resultado if r["estado"] == "pagado"])
-    morosos = len([r for r in resultado if r["estado"] == "moroso"])
-
     return {
-        "anio": anio, "mes": mes,
-        "precio_unitario": precio_unitario,
-        "familias": resultado,
+        "anio": anio, "mes": mes, "precio_unitario": precio_unitario, "familias": resultado,
         "resumen": {
             "total_familias": len(resultado),
-            "pagados": pagados,
-            "morosos": morosos,
-            "total_cobrado": round(total_cobrado, 2),
-            "total_pagado": round(total_pagado, 2),
-            "total_deuda": round(total_deuda, 2),
+            "pagados": len([r for r in resultado if r["estado"]=="pagado"]),
+            "morosos": len([r for r in resultado if r["estado"]=="moroso"]),
+            "total_cobrado": round(sum(r["cobro_calculado"] for r in resultado), 2),
+            "total_pagado": round(sum(r["pagado"] for r in resultado), 2),
+            "total_deuda": round(sum(r["deuda"] for r in resultado), 2),
         }
     }
 
 # ============================================================================
-# ENDPOINTS — CIERRE DE MES v2.9.1
+# CIERRE DE MES
 # ============================================================================
-
 def _calcular_resumen_mes(cur, anio: int, mes: int) -> dict:
-    """
-    Calcula el resumen completo de un mes para cierre o informe.
-    v2.9.2 OPTIMIZADO: 5 queries totales en vez de N*4 queries en loop.
-    Antes: ~3500 queries para 864 familias. Ahora: siempre 5.
-    """
     mes_str = f"{anio}-{mes:02d}"
-
-    # ── 1. Precio del mes ────────────────────────────────────────────────────
     cur.execute("SELECT precio_unitario FROM precios_mes WHERE anio=%s AND mes=%s", (anio, mes))
     precio_row = cur.fetchone()
     precio_unitario = float(precio_row[0]) if precio_row else 0
 
-    # ── 2. Entregas del mes — agrupadas por nombre (1 query total) ──────────
-    cur.execute("""
-        SELECT nombre, COUNT(*) as entregas, SUM(litros) as litros_total
-        FROM entregas
-        WHERE fecha LIKE %s AND estado IN (1,5,6,7)
-        GROUP BY nombre
-    """, (f"{mes_str}%",))
-    entregas_map = {
-        row[0].strip().lower(): {"entregas": row[1], "litros_total": row[2] or 0}
-        for row in cur.fetchall()
-    }
+    cur.execute("""SELECT nombre, COUNT(*) as entregas, SUM(litros) as litros_total
+        FROM entregas WHERE fecha LIKE %s AND estado IN (1,5,6,7) GROUP BY nombre""", (f"{mes_str}%",))
+    entregas_map = {row[0].strip().lower(): {"entregas": row[1], "litros_total": row[2] or 0}
+                    for row in cur.fetchall()}
 
-    # ── 3. Familias + pagos del mes + coordenadas + residentes (1 query) ────
     cur.execute("""
-        SELECT
-            f.id, f.nombre, f.camion, f.litros, f.telefono,
-            COALESCE(SUM(p.monto), 0) as pagado,
-            ra.latitud, ra.longitud
+        SELECT f.id, f.nombre, f.camion, f.litros, f.telefono,
+               COALESCE(SUM(p.monto), 0) as pagado, ra.latitud, ra.longitud
         FROM familias f
         LEFT JOIN pagos p ON p.familia_id = f.id AND p.anio = %s AND p.mes = %s
         LEFT JOIN LATERAL (
-            SELECT latitud, longitud
-            FROM rutas_activas
-            WHERE LOWER(nombre) = LOWER(f.nombre)
-            LIMIT 1
+            SELECT latitud, longitud FROM rutas_activas WHERE LOWER(nombre) = LOWER(f.nombre) LIMIT 1
         ) ra ON true
         WHERE f.activo = TRUE
         GROUP BY f.id, f.nombre, f.camion, f.litros, f.telefono, ra.latitud, ra.longitud
@@ -1317,37 +1037,24 @@ def _calcular_resumen_mes(cur, anio: int, mes: int) -> dict:
     """, (anio, mes))
     familias_raw = cur.fetchall()
 
-    # ── 4. Todos los residentes de una vez (1 query) ─────────────────────────
-    cur.execute("""
-        SELECT familia_id, nombre, rut
-        FROM residentes
-        ORDER BY familia_id, id
-    """)
+    cur.execute("SELECT familia_id, nombre, rut FROM residentes ORDER BY familia_id, id")
     residentes_map = {}
     for r in cur.fetchall():
-        fid_r = r[0]
-        if fid_r not in residentes_map:
-            residentes_map[fid_r] = []
-        residentes_map[fid_r].append({"nombre": r[1], "rut": r[2] or ""})
+        if r[0] not in residentes_map: residentes_map[r[0]] = []
+        residentes_map[r[0]].append({"nombre": r[1], "rut": r[2] or ""})
 
-    # ── 5. Deuda acumulada de cierres anteriores (1 query, con fallback) ────
     deuda_acumulada_map = {}
     try:
         cur.execute("SAVEPOINT sp_deuda_bulk")
-        cur.execute("""
-            SELECT familia_id, COALESCE(SUM(deuda), 0)
-            FROM cierres_detalle
-            WHERE (anio < %s OR (anio = %s AND mes < %s)) AND deuda > 0
-            GROUP BY familia_id
-        """, (anio, anio, mes))
-        for row in cur.fetchall():
-            deuda_acumulada_map[row[0]] = float(row[1])
+        cur.execute("""SELECT familia_id, COALESCE(SUM(deuda), 0) FROM cierres_detalle
+            WHERE (anio < %s OR (anio = %s AND mes < %s)) AND deuda > 0 GROUP BY familia_id""",
+            (anio, anio, mes))
+        for row in cur.fetchall(): deuda_acumulada_map[row[0]] = float(row[1])
         cur.execute("RELEASE SAVEPOINT sp_deuda_bulk")
     except Exception as e:
-        log.warning(f"[deuda_acumulada_bulk] cierres_detalle no disponible aún: {e}")
+        log.warning(f"[deuda_acumulada_bulk] {e}")
         cur.execute("ROLLBACK TO SAVEPOINT sp_deuda_bulk")
 
-    # ── Armar resultado en Python (sin más queries) ──────────────────────────
     familias = []
     for row in familias_raw:
         fid, nombre, camion, litros, telefono, pagado, latitud, longitud = row
@@ -1357,38 +1064,26 @@ def _calcular_resumen_mes(cur, anio: int, mes: int) -> dict:
         cobro = n_entregas * personas * precio_unitario if precio_unitario > 0 else 0
         deuda_mes = max(0, cobro - float(pagado))
         deuda_acumulada = deuda_acumulada_map.get(fid, 0)
-
         familias.append({
-            "id": fid,
-            "nombre": nombre,
-            "camion": camion,
-            "litros": litros,
-            "personas": personas,
-            "telefono": telefono or "",
-            "entregas_mes": n_entregas,
-            "cobro_calculado": round(cobro, 2),
-            "pagado": round(float(pagado), 2),
-            "deuda_mes": round(deuda_mes, 2),
+            "id": fid, "nombre": nombre, "camion": camion, "litros": litros,
+            "personas": personas, "telefono": telefono or "",
+            "entregas_mes": n_entregas, "cobro_calculado": round(cobro, 2),
+            "pagado": round(float(pagado), 2), "deuda_mes": round(deuda_mes, 2),
             "deuda_acumulada": round(deuda_acumulada, 2),
             "deuda_total": round(deuda_mes + deuda_acumulada, 2),
-            "estado": "pagado" if deuda_mes <= 0 and cobro > 0 else "moroso" if cobro > 0 else "sin_entregas",
+            "estado": "pagado" if deuda_mes<=0 and cobro>0 else "moroso" if cobro>0 else "sin_entregas",
             "residentes": residentes_map.get(fid, []),
             "latitud": float(latitud) if latitud else None,
             "longitud": float(longitud) if longitud else None,
         })
 
-    pagados = [f for f in familias if f["estado"] == "pagado"]
-    morosos = [f for f in familias if f["estado"] == "moroso"]
-
+    pagados = [f for f in familias if f["estado"]=="pagado"]
+    morosos = [f for f in familias if f["estado"]=="moroso"]
     return {
-        "anio": anio, "mes": mes,
-        "precio_unitario": precio_unitario,
-        "familias": familias,
-        "pagados": pagados,
-        "morosos": morosos,
+        "anio": anio, "mes": mes, "precio_unitario": precio_unitario,
+        "familias": familias, "pagados": pagados, "morosos": morosos,
         "resumen": {
-            "total_familias": len(familias),
-            "total_pagados": len(pagados),
+            "total_familias": len(familias), "total_pagados": len(pagados),
             "total_morosos": len(morosos),
             "total_cobrado": round(sum(f["cobro_calculado"] for f in familias), 2),
             "total_pagado": round(sum(f["pagado"] for f in familias), 2),
@@ -1396,139 +1091,75 @@ def _calcular_resumen_mes(cur, anio: int, mes: int) -> dict:
         }
     }
 
-
 @app.post("/cierres-mes")
-def cerrar_mes(anio: int = Query(...), mes: int = Query(...)):
-    if not (DATA_MODE == "db" and pool):
-        raise HTTPException(503, "DB no disponible")
+def cerrar_mes(anio: int=Query(...), mes: int=Query(...)):
+    if not (DATA_MODE == "db" and pool): raise HTTPException(503, "DB no disponible")
     conn = db_conn(); cur = conn.cursor()
-
     cur.execute("SELECT estado FROM cierres_mes WHERE anio=%s AND mes=%s", (anio, mes))
     cierre_existente = cur.fetchone()
     if cierre_existente and cierre_existente[0] == "cerrado":
-        cur.close(); db_put(conn)
-        raise HTTPException(400, f"El mes {mes}/{anio} ya está cerrado")
-
-    data = _calcular_resumen_mes(cur, anio, mes)
-    r = data["resumen"]
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS cierres_detalle (
-            id           SERIAL PRIMARY KEY,
-            cierre_id    INTEGER,
-            familia_id   INTEGER,
-            nombre       VARCHAR(200),
-            camion       VARCHAR(10),
-            litros       INTEGER,
-            personas     INTEGER,
-            entregas_mes INTEGER,
-            cobro        NUMERIC(10,2),
-            pagado       NUMERIC(10,2),
-            deuda        NUMERIC(10,2),
-            estado       VARCHAR(20),
-            anio         INTEGER,
-            mes          INTEGER
-        )
-    """)
-
-    cur.execute("""
-        INSERT INTO cierres_mes
-            (anio, mes, cerrado_por, precio_unitario, total_familias,
-             total_pagados, total_morosos, total_cobrado, total_pagado, total_deuda, estado)
+        cur.close(); db_put(conn); raise HTTPException(400, f"El mes {mes}/{anio} ya está cerrado")
+    data = _calcular_resumen_mes(cur, anio, mes); r = data["resumen"]
+    cur.execute("""INSERT INTO cierres_mes
+        (anio, mes, cerrado_por, precio_unitario, total_familias, total_pagados, total_morosos,
+         total_cobrado, total_pagado, total_deuda, estado)
         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'cerrado')
-        ON CONFLICT (anio, mes) DO UPDATE SET
-            cerrado_en=NOW(), estado='cerrado',
-            precio_unitario=EXCLUDED.precio_unitario,
-            total_familias=EXCLUDED.total_familias,
-            total_pagados=EXCLUDED.total_pagados,
-            total_morosos=EXCLUDED.total_morosos,
-            total_cobrado=EXCLUDED.total_cobrado,
-            total_pagado=EXCLUDED.total_pagado,
-            total_deuda=EXCLUDED.total_deuda
-        RETURNING id
-    """, (anio, mes, "admin", data["precio_unitario"],
-          r["total_familias"], r["total_pagados"], r["total_morosos"],
-          r["total_cobrado"], r["total_pagado"], r["total_deuda"]))
+        ON CONFLICT (anio, mes) DO UPDATE SET cerrado_en=NOW(), estado='cerrado',
+            precio_unitario=EXCLUDED.precio_unitario, total_familias=EXCLUDED.total_familias,
+            total_pagados=EXCLUDED.total_pagados, total_morosos=EXCLUDED.total_morosos,
+            total_cobrado=EXCLUDED.total_cobrado, total_pagado=EXCLUDED.total_pagado,
+            total_deuda=EXCLUDED.total_deuda RETURNING id""",
+        (anio, mes, "admin", data["precio_unitario"], r["total_familias"], r["total_pagados"],
+         r["total_morosos"], r["total_cobrado"], r["total_pagado"], r["total_deuda"]))
     cierre_id = cur.fetchone()[0]
-
     cur.execute("DELETE FROM cierres_detalle WHERE cierre_id=%s", (cierre_id,))
-
     for f in data["familias"]:
-        cur.execute("""
-            INSERT INTO cierres_detalle
-                (cierre_id, familia_id, nombre, camion, litros, personas,
-                 entregas_mes, cobro, pagado, deuda, estado, anio, mes)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        """, (cierre_id, f["id"], f["nombre"], f["camion"], f["litros"],
-              f["personas"], f["entregas_mes"], f["cobro_calculado"],
-              f["pagado"], f["deuda_mes"], f["estado"], anio, mes))
-
+        cur.execute("""INSERT INTO cierres_detalle
+            (cierre_id, familia_id, nombre, camion, litros, personas, entregas_mes,
+             cobro, pagado, deuda, estado, anio, mes)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+            (cierre_id, f["id"], f["nombre"], f["camion"], f["litros"], f["personas"],
+             f["entregas_mes"], f["cobro_calculado"], f["pagado"], f["deuda_mes"], f["estado"], anio, mes))
     conn.commit(); cur.close(); db_put(conn)
-    log.info(f"[CIERRE] Mes {mes}/{anio} cerrado — {r['total_morosos']} morosos, deuda total ${r['total_deuda']}")
     return {"status": "ok", "cierre_id": cierre_id, "resumen": r}
 
-
 @app.post("/cierres-mes/reabrir")
-def reabrir_mes(anio: int = Query(...), mes: int = Query(...)):
-    if not (DATA_MODE == "db" and pool):
-        raise HTTPException(503, "DB no disponible")
+def reabrir_mes(anio: int=Query(...), mes: int=Query(...)):
+    if not (DATA_MODE == "db" and pool): raise HTTPException(503, "DB no disponible")
     conn = db_conn(); cur = conn.cursor()
-    cur.execute(
-        "UPDATE cierres_mes SET estado='abierto', cerrado_en=NOW() WHERE anio=%s AND mes=%s",
-        (anio, mes)
-    )
-    if cur.rowcount == 0:
-        cur.close(); db_put(conn)
-        raise HTTPException(404, "Cierre no encontrado")
+    cur.execute("UPDATE cierres_mes SET estado='abierto', cerrado_en=NOW() WHERE anio=%s AND mes=%s", (anio, mes))
+    if cur.rowcount == 0: cur.close(); db_put(conn); raise HTTPException(404, "Cierre no encontrado")
     conn.commit(); cur.close(); db_put(conn)
-    log.info(f"[CIERRE] Mes {mes}/{anio} reabierto")
-    return {"status": "ok", "mensaje": f"Mes {mes}/{anio} reabierto correctamente"}
-
+    return {"status": "ok", "mensaje": f"Mes {mes}/{anio} reabierto"}
 
 @app.get("/cierres-mes")
 def listar_cierres():
-    if not (DATA_MODE == "db" and pool):
-        raise HTTPException(503, "DB no disponible")
+    if not (DATA_MODE == "db" and pool): raise HTTPException(503, "DB no disponible")
     conn = db_conn(); cur = conn.cursor()
-    cur.execute("""
-        SELECT id, anio, mes, estado, cerrado_en,
-               total_familias, total_pagados, total_morosos,
-               total_cobrado, total_pagado, total_deuda, precio_unitario
-        FROM cierres_mes ORDER BY anio DESC, mes DESC
-    """)
-    cols = ["id","anio","mes","estado","cerrado_en","total_familias",
-            "total_pagados","total_morosos","total_cobrado","total_pagado",
-            "total_deuda","precio_unitario"]
+    cur.execute("""SELECT id, anio, mes, estado, cerrado_en, total_familias, total_pagados,
+        total_morosos, total_cobrado, total_pagado, total_deuda, precio_unitario
+        FROM cierres_mes ORDER BY anio DESC, mes DESC""")
+    cols = ["id","anio","mes","estado","cerrado_en","total_familias","total_pagados",
+            "total_morosos","total_cobrado","total_pagado","total_deuda","precio_unitario"]
     rows = [dict(zip(cols, r)) for r in cur.fetchall()]
     for r in rows:
-        if r.get("cerrado_en"):
-            r["cerrado_en"] = str(r["cerrado_en"])
+        if r.get("cerrado_en"): r["cerrado_en"] = str(r["cerrado_en"])
     cur.close(); db_put(conn)
     return rows
 
-
 @app.get("/cierres-mes/informe")
-def informe_cierre(anio: int = Query(...), mes: int = Query(...)):
-    """
-    Retorna datos completos del informe de cierre para generar PDF/Excel en frontend.
-    FIX v2.9.1: _calcular_resumen_mes ya no rompe la transacción.
-    """
-    if not (DATA_MODE == "db" and pool):
-        raise HTTPException(503, "DB no disponible")
+def informe_cierre(anio: int=Query(...), mes: int=Query(...)):
+    if not (DATA_MODE == "db" and pool): raise HTTPException(503, "DB no disponible")
     conn = db_conn(); cur = conn.cursor()
-
     try:
         data = _calcular_resumen_mes(cur, anio, mes)
-
         cur.execute("SELECT estado, cerrado_en FROM cierres_mes WHERE anio=%s AND mes=%s", (anio, mes))
         cierre = cur.fetchone()
         data["cerrado"] = cierre[0] == "cerrado" if cierre else False
         data["cerrado_en"] = str(cierre[1]) if cierre and cierre[1] else None
-
         cur.close(); db_put(conn)
         return data
-
     except Exception as e:
-        log.error(f"[INFORME CIERRE ERROR] anio={anio} mes={mes}: {e}")
+        log.error(f"[INFORME CIERRE ERROR] {e}")
         cur.close(); db_put(conn)
         raise HTTPException(500, f"Error al calcular informe: {str(e)}")
