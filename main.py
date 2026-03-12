@@ -217,7 +217,7 @@ def audit_log(user: str, action: str, meta: dict):
 # ============================================================================
 # HELPERS RUTAS
 # ============================================================================
-RUTAS_COLUMNS = ["id", "camion", "nombre", "dia", "litros", "telefono", "latitud", "longitud"]
+RUTAS_COLUMNS = ["id", "camion", "nombre", "dia", "litros", "telefono", "correo", "latitud", "longitud"]
 
 def read_rutas_excel() -> pd.DataFrame:
     if EXCEL_FILE.exists():
@@ -237,7 +237,7 @@ def write_rutas_excel(df: pd.DataFrame):
 
 def read_rutas_db() -> pd.DataFrame:
     conn = db_conn(); cur = conn.cursor()
-    cur.execute("""SELECT id, camion, nombre, dia, litros, telefono, latitud, longitud
+    cur.execute("""SELECT id, camion, nombre, dia, litros, telefono, correo, latitud, longitud
                    FROM rutas_activas ORDER BY camion, dia, nombre""")
     rows = cur.fetchall(); cur.close(); db_put(conn)
     return pd.DataFrame(rows, columns=RUTAS_COLUMNS)
@@ -685,7 +685,7 @@ def add_ruta_activa(nuevo: NuevoPunto):
 @app.put("/rutas-activas/{id}")
 def update_ruta_activa(id: int, cambios: dict):
     if DATA_MODE == "db" and pool:
-        campos_validos = ["camion", "nombre", "dia", "litros", "telefono", "latitud", "longitud"]
+        campos_validos = ["camion", "nombre", "dia", "litros", "telefono", "correo", "latitud", "longitud"]
         sets = []; vals = []
         for key, val in cambios.items():
             if key in campos_validos:
@@ -780,10 +780,13 @@ def _init_db():
                 dia       VARCHAR(20),
                 litros    INTEGER DEFAULT 0,
                 telefono  VARCHAR(50),
+                correo    VARCHAR(200),
                 latitud   DOUBLE PRECISION,
                 longitud  DOUBLE PRECISION
             )
         """)
+        # Para DBs ya existentes: agregar columna si no existe
+        cur.execute("ALTER TABLE rutas_activas ADD COLUMN IF NOT EXISTS correo VARCHAR(200)")
 
         cur.execute("""
             CREATE TABLE IF NOT EXISTS entregas (
