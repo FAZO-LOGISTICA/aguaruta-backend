@@ -107,7 +107,7 @@ def db_put(conn):
 # ============================================================================
 # APP + CORS
 # ============================================================================
-app = FastAPI(title=APP_NAME, version="2.9.4")
+app = FastAPI(title=APP_NAME, version="2.9.5")
 
 app.add_middleware(
     CORSMiddleware,
@@ -816,7 +816,7 @@ def auditoria_list():
 @app.on_event("startup")
 def startup():
     excel_ok = EXCEL_FILE.exists()
-    log.info(f"🚀 AguaRuta Backend v2.9.4 | DATA_MODE={DATA_MODE} | Excel={'✅' if excel_ok else '⚠️ FALLBACK'} | Rutas fallback={len(RUTAS_FALLBACK)}")
+    log.info(f"🚀 AguaRuta Backend v2.9.5 | DATA_MODE={DATA_MODE} | Excel={'✅' if excel_ok else '⚠️ FALLBACK'} | Rutas fallback={len(RUTAS_FALLBACK)}")
     if DATA_MODE == "db" and pool:
         _init_db()
 
@@ -1038,281 +1038,75 @@ def get_familias(camion: Optional[str] = Query(None), q: Optional[str] = Query(N
         raise HTTPException(503, "DB no disponible")
     conn = db_conn(); cur = conn.cursor()
 
-    cur.execute("SELECT COUNT(*) FROM familias")
-    if cur.fetchone()[0] == 0:
-        cur.execute("SELECT id, camion, nombre, litros, telefono FROM rutas_activas")
-        rutas = cur.fetchall()
-        for r in rutas:
-            cur.execute("""
-                INSERT INTO familias (ruta_id, camion, nombre, litros, telefono)
-                VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT DO NOTHING
-            """, (r[0], r[1], r[2], r[3] or 700, r[4] or ""))
-        conn.commit()
-        log.info(f"✅ {len(rutas)} familias sincronizadas desde rutas_activas")
-
-    conditions = ["f.activo = TRUE"]
-    params = []
-    if camion:
-        conditions.append("f.camion = %s"); params.append(camion.upper())
-    if q:
-        conditions.append("f.nombre ILIKE %s"); params.append(f"%{q}%")
-
-    where = "WHERE " + " AND ".join(conditions)
-    cur.execute(f"""
-        SELECT f.id, f.nombre, f.camion, f.litros, f.telefono,
-               COUNT(r.id) as residentes
-        FROM familias f
-        LEFT JOIN residentes r ON r.familia_id = f.id
-        {where}
-        GROUP BY f.id, f.nombre, f.camion, f.litros, f.telefono
-        ORDER BY f.camion, f.nombre
-    """, params)
-    cols = ["id","nombre","camion","litros","telefono","residentes"]
-    rows = [dict(zip(cols, row)) for row in cur.fetchall()]
-    cur.close(); db_put(conn)
-    return rows
-
-
-@app.put("/familias/{familia_id}")
-def update_familia(familia_id: int, cambios: dict):
-    if not (DATA_MODE == "db" and pool):
-        raise HTTPException(503, "DB no disponible")
-    campos_validos = ["nombre", "camion", "litros", "telefono"]
-    sets = []; vals = []
-    for key, val in cambios.items():
-        if key in campos_validos:
-            sets.append(f"{key} = %s"); vals.append(val)
-    if not sets:
-        raise HTTPException(400, "Sin campos válidos")
-    vals.append(familia_id)
-    conn = db_conn(); cur = conn.cursor()
-    cur.execute(f"UPDATE familias SET {', '.join(sets)} WHERE id = %s AND activo = TRUE", vals)
-    if cur.rowcount == 0:
-        cur.close(); db_put(conn)
-        raise HTTPException(404, "Familia no encontrada")
-    conn.commit(); cur.close(); db_put(conn)
-    return {"status": "ok"}
-
-
-@app.get("/familias/{familia_id}")
-def get_familia(familia_id: int):
-    if not (DATA_MODE == "db" and pool):
-        raise HTTPException(503, "DB no disponible")
-    conn = db_conn(); cur = conn.cursor()
-
-    cur.execute("""
-        SELECT id, nombre, camion, litros, telefono, ruta_id
-        FROM familias WHERE id = %s AND activo = TRUE
-    """, (familia_id,))
-    row = cur.fetchone()
-    if not row:
-        cur.close(); db_put(conn); raise HTTPException(404, "Familia no encontrada")
-
-    familia = dict(zip(["id","nombre","camion","litros","telefono","ruta_id"], row))
-    familia["personas"] = familia["litros"] // 700
-    familia["litros_extra"] = familia["litros"] % 700
-
-    cur.execute("""
-        SELECT id, nombre, rut, observacion
-        FROM residentes WHERE familia_id = %s ORDER BY id
-    """, (familia_id,))
-    familia["residentes"] = [dict(zip(["id","nombre","rut","observacion"], r)) for r in cur.fetchall()]
-
-    cur.execute("""
-        SELECT id, anio, mes, monto, forma_pago, observacion, created_at
-        FROM pagos WHERE familia_id = %s
-        ORDER BY anio DESC, mes DESC LIMIT 12
-    """, (familia_id,))
-    familia["pagos"] = [dict(zip(["id","anio","mes","monto","forma_pago","observacion","created_at"], r)) for r in cur.fetchall()]
-
-    cur.close(); db_put(conn)
-    return familia
-
-
-@app.post("/familias/{familia_id}/residentes")
-def agregar_residente(familia_id: int, residente: Residente):
-    if not (DATA_MODE == "db" and pool):
-        raise HTTPException(503, "DB no disponible")
-    conn = db_conn(); cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO residentes (familia_id, nombre, rut, observacion)
-        VALUES (%s, %s, %s, %s) RETURNING id
-    """, (familia_id, residente.nombre, residente.rut, residente.observacion))
-    new_id = cur.fetchone()[0]
-    conn.commit(); cur.close(); db_put(conn)
-    return {"status": "ok", "id": new_id}
-
-@app.put("/residentes/{residente_id}")
-def actualizar_residente(residente_id: int, residente: Residente):
-    if not (DATA_MODE == "db" and pool):
-        raise HTTPException(503, "DB no disponible")
-    conn = db_conn(); cur = conn.cursor()
-    cur.execute("""
-        UPDATE residentes SET nombre=%s, rut=%s, observacion=%s WHERE id=%s
-    """, (residente.nombre, residente.rut, residente.observacion, residente_id))
-    conn.commit(); cur.close(); db_put(conn)
-    return {"status": "ok"}
-
-@app.delete("/residentes/{residente_id}")
-def eliminar_residente(residente_id: int):
-    if not (DATA_MODE == "db" and pool):
-        raise HTTPException(503, "DB no disponible")
-    conn = db_conn(); cur = conn.cursor()
-    cur.execute("DELETE FROM residentes WHERE id = %s", (residente_id,))
-    conn.commit(); cur.close(); db_put(conn)
-    return {"status": "ok"}
-
-
-@app.get("/precios-mes")
-def get_precios():
-    if not (DATA_MODE == "db" and pool):
-        raise HTTPException(503, "DB no disponible")
-    conn = db_conn(); cur = conn.cursor()
-    cur.execute("SELECT id, anio, mes, precio_unitario FROM precios_mes ORDER BY anio DESC, mes DESC")
-    rows = [dict(zip(["id","anio","mes","precio_unitario"], r)) for r in cur.fetchall()]
-    cur.close(); db_put(conn)
-    return rows
-
-@app.post("/precios-mes")
-def set_precio_mes(precio: PrecioMes):
-    if not (DATA_MODE == "db" and pool):
-        raise HTTPException(503, "DB no disponible")
-    conn = db_conn(); cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO precios_mes (anio, mes, precio_unitario)
-        VALUES (%s, %s, %s)
-        ON CONFLICT (anio, mes) DO UPDATE SET precio_unitario = EXCLUDED.precio_unitario
-        RETURNING id
-    """, (precio.anio, precio.mes, precio.precio_unitario))
-    new_id = cur.fetchone()[0]
-    conn.commit(); cur.close(); db_put(conn)
-    return {"status": "ok", "id": new_id}
-
-
-@app.post("/pagos")
-def registrar_pago(pago: RegistrarPago):
-    if not (DATA_MODE == "db" and pool):
-        raise HTTPException(503, "DB no disponible")
-    conn = db_conn(); cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO pagos (familia_id, anio, mes, monto, forma_pago, observacion, registrado_por)
-        VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id
-    """, (pago.jefe_id, pago.anio, pago.mes, pago.monto,
-          pago.forma_pago, pago.observacion, "admin"))
-    new_id = cur.fetchone()[0]
-    conn.commit(); cur.close(); db_put(conn)
-    return {"status": "ok", "id": new_id}
-
-@app.delete("/pagos/{pago_id}")
-def eliminar_pago(pago_id: int):
-    if not (DATA_MODE == "db" and pool):
-        raise HTTPException(503, "DB no disponible")
-    conn = db_conn(); cur = conn.cursor()
-    cur.execute("DELETE FROM pagos WHERE id = %s", (pago_id,))
-    conn.commit(); cur.close(); db_put(conn)
-    return {"status": "ok"}
-
-
-@app.get("/resumen-pagos")
-def resumen_pagos(
-    anio: int = Query(...),
-    mes: int = Query(...),
-    camion: Optional[str] = Query(None),
-    dia: Optional[str] = Query(None),
-    limit: int = Query(50),
-    offset: int = Query(0)
-):
-    if not (DATA_MODE == "db" and pool):
-        raise HTTPException(503, "DB no disponible")
-    conn = db_conn(); cur = conn.cursor()
-
-    cur.execute("SELECT COUNT(*) FROM familias")
-    if cur.fetchone()[0] == 0:
-        cur.execute("SELECT id, camion, nombre, litros, telefono FROM rutas_activas")
-        rutas_sync = cur.fetchall()
-        for r in rutas_sync:
-            cur.execute(
-                "INSERT INTO familias (ruta_id, camion, nombre, litros, telefono) VALUES (%s,%s,%s,%s,%s)",
-                (r[0], r[1], r[2], r[3] or 700, r[4] or "")
-            )
-        conn.commit()
-
-    nombres_dia = None
-    if dia and camion:
-        cur.execute(
-            "SELECT DISTINCT nombre FROM rutas_activas WHERE UPPER(dia)=%s AND UPPER(camion)=%s",
-            (dia.upper(), camion.upper())
-        )
-        nombres_dia = {r[0].strip().lower() for r in cur.fetchall()}
-    elif dia:
-        cur.execute(
-            "SELECT DISTINCT nombre FROM rutas_activas WHERE UPPER(dia)=%s",
-            (dia.upper(),)
-        )
-        nombres_dia = {r[0].strip().lower() for r in cur.fetchall()}
-
+    # ✅ v2.9.5 Lee directo de rutas_activas — fuente de verdad
     cur.execute("SELECT precio_unitario FROM precios_mes WHERE anio=%s AND mes=%s", (anio, mes))
     precio_row = cur.fetchone()
     precio_unitario = float(precio_row[0]) if precio_row else 0
 
     mes_str = f"{anio}-{mes:02d}"
-    conditions = ["e.fecha LIKE %s"]
-    params = [f"{mes_str}%"]
-    if camion:
-        conditions.append("e.camion = %s"); params.append(camion.upper())
 
-    cur.execute(f"""
-        SELECT e.nombre, e.camion, COUNT(*) as entregas, SUM(e.litros) as litros_total
-        FROM entregas e
-        WHERE {' AND '.join(conditions)} AND e.estado IN (1,5,6,7)
-        GROUP BY e.nombre, e.camion
-    """, params)
-    entregas_map = {}
-    for row in cur.fetchall():
-        entregas_map[row[0].strip().lower()] = {
-            "entregas": row[2], "litros_total": row[3] or 0
-        }
+    # Entregas del mes agrupadas por nombre
+    ent_cond = ["fecha LIKE %s"]; ent_params = [f"{mes_str}%"]
+    if camion: ent_cond.append("camion = %s"); ent_params.append(camion.upper())
+    cur.execute(
+        f"SELECT nombre, COUNT(*) FROM entregas WHERE {' AND '.join(ent_cond)} AND estado IN (1,5,6,7) GROUP BY nombre",
+        ent_params
+    )
+    entregas_map = {row[0].strip().lower(): row[1] for row in cur.fetchall()}
 
-    fam_conditions = ["f.activo = TRUE"]
-    fam_params = []
-    if camion:
-        fam_conditions.append("f.camion = %s"); fam_params.append(camion.upper())
-
-    cur.execute(f"""
-        SELECT f.id, f.nombre, f.camion, f.litros,
-               COALESCE(SUM(p.monto), 0) as pagado
+    # Pagos del mes por nombre via familias
+    cur.execute("""
+        SELECT LOWER(TRIM(f.nombre)), COALESCE(SUM(p.monto), 0), f.id
         FROM familias f
         LEFT JOIN pagos p ON p.familia_id = f.id AND p.anio = %s AND p.mes = %s
-        WHERE {' AND '.join(fam_conditions)}
-        GROUP BY f.id, f.nombre, f.camion, f.litros
-        ORDER BY f.camion, f.nombre
-    """, [anio, mes] + fam_params)
+        GROUP BY f.nombre, f.id
+    """, (anio, mes))
+    pagos_map = {}; famid_map = {}
+    for row in cur.fetchall():
+        pagos_map[row[0]] = float(row[1])
+        famid_map[row[0]] = row[2]
+
+    # Rutas activas como fuente de verdad
+    r_cond = ["1=1"]; r_params = []
+    if camion: r_cond.append("camion = %s"); r_params.append(camion.upper())
+    if dia: r_cond.append("UPPER(dia) = %s"); r_params.append(dia.upper())
+    cur.execute(
+        f"SELECT id, nombre, camion, litros FROM rutas_activas WHERE {' AND '.join(r_cond)} ORDER BY camion, nombre",
+        r_params
+    )
+    rutas = cur.fetchall()
+    total_count_rutas = len(rutas)
+    rutas_pagina = rutas[offset: offset + limit]
 
     resultado = []
-    for row in cur.fetchall():
-        fid, nombre, cam, litros, pagado = row
-        if nombres_dia is not None and nombre.strip().lower() not in nombres_dia:
-            continue
-        personas = litros // 700
-        data_entrega = entregas_map.get(nombre.strip().lower(), {"entregas": 0, "litros_total": 0})
-        n_entregas = data_entrega["entregas"]
+    for row in rutas_pagina:
+        rid, nombre, cam, litros = row
+        nombre_key = nombre.strip().lower()
+        personas = (litros or 700) // 700
+        n_entregas = entregas_map.get(nombre_key, 0)
+        pagado = pagos_map.get(nombre_key, 0.0)
+        fid = famid_map.get(nombre_key, rid)
         cobro_calculado = n_entregas * personas * precio_unitario if precio_unitario > 0 else 0
-        deuda = max(0, cobro_calculado - float(pagado))
-
+        deuda = max(0, cobro_calculado - pagado)
         resultado.append({
             "id": fid,
             "nombre": nombre,
             "camion": cam,
-            "litros": litros,
+            "litros": litros or 700,
             "personas": personas,
             "entregas_mes": n_entregas,
             "cobro_calculado": round(cobro_calculado, 2),
-            "pagado": round(float(pagado), 2),
+            "pagado": round(pagado, 2),
             "deuda": round(deuda, 2),
             "estado": "pagado" if deuda <= 0 and cobro_calculado > 0 else "moroso" if cobro_calculado > 0 else "sin_entregas",
         })
 
+    # KPIs globales sobre todas las rutas (no solo página)
+    cur.execute(
+        f"SELECT COUNT(*) FROM rutas_activas WHERE {' AND '.join(r_cond)}",
+        r_params
+    )
+    total_familias_global = cur.fetchone()[0]
     cur.close(); db_put(conn)
     total_cobrado = sum(r["cobro_calculado"] for r in resultado)
     total_pagado = sum(r["pagado"] for r in resultado)
@@ -1320,18 +1114,14 @@ def resumen_pagos(
     pagados = len([r for r in resultado if r["estado"] == "pagado"])
     morosos = len([r for r in resultado if r["estado"] == "moroso"])
 
-    # ✅ v2.9.3 PAGINACIÓN
-    total_count = len(resultado)
-    pagina = resultado[offset: offset + limit]
-
     return {
         "anio": anio, "mes": mes,
         "precio_unitario": precio_unitario,
-        "familias": pagina,
-        "total_count": total_count,
+        "familias": resultado,
+        "total_count": total_count_rutas,
         "offset": offset,
         "limit": limit,
-        "hay_mas": (offset + limit) < total_count,
+        "hay_mas": (offset + limit) < total_count_rutas,
         "resumen": {
             "total_familias": total_count,
             "pagados": pagados,
