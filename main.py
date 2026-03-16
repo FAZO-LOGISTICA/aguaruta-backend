@@ -727,17 +727,20 @@ def update_ruta_activa(id: int, cambios: dict):
             cur.close(); db_put(conn)
             raise HTTPException(404, f"Registro {id} no encontrado")
         conn.commit()
-        # ✅ v2.9.3 SYNC: propagar cambios relevantes a familias
+        # ✅ v2.9.4 SYNC: propagar cambios a familias por ruta_id O por nombre
         campos_familia = {k: v for k, v in cambios.items() if k in ["nombre", "camion", "litros", "telefono"]}
         if campos_familia:
-            sets_f = [f"{k} = %s" for k in campos_familia]
-            vals_f = list(campos_familia.values())
-            cur.execute(
-                f"UPDATE familias SET {', '.join(sets_f)} WHERE ruta_id = %s AND activo = TRUE",
-                vals_f + [id]
-            )
-            conn.commit()
-            log.info(f"[SYNC FAMILIA] ruta_id={id} actualizada en familias: {list(campos_familia.keys())}")
+            cur.execute("SELECT nombre FROM rutas_activas WHERE id = %s", (id,))
+            ruta_nombre = cur.fetchone()
+            if ruta_nombre:
+                sets_f = [f"{k} = %s" for k in campos_familia]
+                vals_f = list(campos_familia.values())
+                cur.execute(
+                    f"UPDATE familias SET {', '.join(sets_f)} WHERE (ruta_id = %s OR LOWER(TRIM(nombre)) = LOWER(TRIM(%s))) AND activo = TRUE",
+                    vals_f + [id, ruta_nombre[0]]
+                )
+                conn.commit()
+                log.info(f"[SYNC FAMILIA] '{ruta_nombre[0]}' actualizada: {list(campos_familia.keys())}")
         cur.execute("SELECT id,camion,nombre,dia,litros,telefono,latitud,longitud FROM rutas_activas WHERE id=%s", (id,))
         row = cur.fetchone()
         cur.close(); db_put(conn)
@@ -761,8 +764,15 @@ def delete_ruta_activa(id: int):
         if cur.rowcount == 0:
             cur.close(); db_put(conn)
             raise HTTPException(404, f"Registro {id} no encontrado")
-        # ✅ v2.9.4 SYNC: desactivar familia correspondiente
-        cur.execute("UPDATE familias SET activo = FALSE WHERE ruta_id = %s", (id,))
+        # ✅ v2.9.4 SYNC: desactivar familia por ruta_id O por nombre
+        cur.execute("SELECT nombre FROM rutas_activas WHERE id = %s", (id,))
+        ruta_row = cur.fetchone()
+        if ruta_row:
+            cur.execute("""
+                UPDATE familias SET activo = FALSE
+                WHERE ruta_id = %s OR LOWER(TRIM(nombre)) = LOWER(TRIM(%s))
+            """, (id, ruta_row[0]))
+            log.info(f"[DELETE SYNC] familia '{ruta_row[0]}' desactivada en familias")
         conn.commit(); cur.close(); db_put(conn)
     else:
         df = read_rutas_excel()
