@@ -1101,10 +1101,13 @@ def get_familias(camion: Optional[str] = Query(None), q: Optional[str] = Query(N
             "estado": "pagado" if deuda <= 0 and cobro_calculado > 0 else "moroso" if cobro_calculado > 0 else "sin_entregas",
         })
 
-    # KPIs globales sobre todas las rutas (no solo página)
+    # KPIs globales — total de rutas con los mismos filtros
+    kpi_cond = ["1=1"]; kpi_params = []
+    if camion: kpi_cond.append("camion = %s"); kpi_params.append(camion.upper())
+    if dia: kpi_cond.append("UPPER(dia) = %s"); kpi_params.append(dia.upper())
     cur.execute(
-        f"SELECT COUNT(*) FROM rutas_activas WHERE {' AND '.join(r_cond)}",
-        r_params
+        f"SELECT COUNT(*) FROM rutas_activas WHERE {' AND '.join(kpi_cond)}",
+        kpi_params
     )
     total_familias_global = cur.fetchone()[0]
     cur.close(); db_put(conn)
