@@ -761,6 +761,8 @@ def delete_ruta_activa(id: int):
         if cur.rowcount == 0:
             cur.close(); db_put(conn)
             raise HTTPException(404, f"Registro {id} no encontrado")
+        # ✅ v2.9.4 SYNC: desactivar familia correspondiente
+        cur.execute("UPDATE familias SET activo = FALSE WHERE ruta_id = %s", (id,))
         conn.commit(); cur.close(); db_put(conn)
     else:
         df = read_rutas_excel()
@@ -954,7 +956,19 @@ def _init_db():
         """)
 
         conn.commit()
-        log.info("✅ Tablas creadas/verificadas en PostgreSQL (v2.9.3)")
+        log.info("✅ Tablas creadas/verificadas en PostgreSQL (v2.9.4)")
+
+        # ✅ v2.9.4 Reparar familias sin ruta_id usando nombre como puente
+        cur.execute("""
+            UPDATE familias f
+            SET ruta_id = ra.id
+            FROM rutas_activas ra
+            WHERE LOWER(TRIM(f.nombre)) = LOWER(TRIM(ra.nombre))
+            AND f.ruta_id IS NULL
+            AND f.activo = TRUE
+        """)
+        conn.commit()
+        log.info("✅ ruta_id reparado en familias sin referencia")
 
         cur.execute("SELECT COUNT(*) FROM rutas_activas")
         count = cur.fetchone()[0]
