@@ -1342,8 +1342,94 @@ def resumen_pagos(
 
 
 # ============================================================================
-# ENDPOINT — RESUMEN PAGOS COMPLETO (para exportar Excel/PDF en una sola query)
+# ENDPOINTS — GESTIÓN DE USUARIOS
 # ============================================================================
+
+@app.get("/usuarios-lista")
+def listar_usuarios_lista():
+    if not (DATA_MODE == "db" and pool):
+        raise HTTPException(503, "DB no disponible")
+    conn = db_conn(); cur = conn.cursor()
+    cur.execute("""
+        SELECT id, usuario, rol, active, created_at
+        FROM usuarios WHERE active = TRUE ORDER BY created_at DESC
+    """)
+    cols = ["id","usuario","rol","active","created_at"]
+    rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    for r in rows:
+        if r.get("created_at"):
+            r["created_at"] = str(r["created_at"])
+    cur.close(); db_put(conn)
+    return rows
+
+
+@app.post("/usuarios-lista")
+def crear_usuario(datos: dict):
+    if not (DATA_MODE == "db" and pool):
+        raise HTTPException(503, "DB no disponible")
+    usuario = datos.get("usuario", "").strip()
+    password = datos.get("password", "")
+    rol = datos.get("rol", "editor")
+    if not usuario or not password:
+        raise HTTPException(400, "Usuario y contraseña son obligatorios")
+    if rol not in ["dios", "editor", "invitado"]:
+        raise HTTPException(400, "Rol inválido")
+    password_hash = hashlib.sha256(password.encode()).hexdigest()
+    conn = db_conn(); cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO usuarios (usuario, password_hash, rol)
+            VALUES (%s, %s, %s) RETURNING id
+        """, (usuario, password_hash, rol))
+        new_id = cur.fetchone()[0]
+        conn.commit(); cur.close(); db_put(conn)
+        log.info(f"[USUARIO] Creado: {usuario} ({rol})")
+        return {"status": "ok", "id": new_id}
+    except Exception as e:
+        conn.rollback(); cur.close(); db_put(conn)
+        if "unique" in str(e).lower():
+            raise HTTPException(400, f"El usuario '{usuario}' ya existe")
+        raise HTTPException(500, str(e))
+
+
+@app.put("/usuarios-lista/{usuario_id}")
+def actualizar_usuario(usuario_id: int, datos: dict):
+    if not (DATA_MODE == "db" and pool):
+        raise HTTPException(503, "DB no disponible")
+    conn = db_conn(); cur = conn.cursor()
+    sets = []; vals = []
+    if "usuario" in datos and datos["usuario"].strip():
+        sets.append("usuario = %s"); vals.append(datos["usuario"].strip())
+    if "rol" in datos and datos["rol"] in ["dios", "editor", "invitado"]:
+        sets.append("rol = %s"); vals.append(datos["rol"])
+    if "password" in datos and datos["password"]:
+        sets.append("password_hash = %s")
+        vals.append(hashlib.sha256(datos["password"].encode()).hexdigest())
+    if not sets:
+        raise HTTPException(400, "Sin campos válidos para actualizar")
+    vals.append(usuario_id)
+    cur.execute(f"UPDATE usuarios SET {', '.join(sets)} WHERE id = %s AND active = TRUE", vals)
+    if cur.rowcount == 0:
+        cur.close(); db_put(conn)
+        raise HTTPException(404, "Usuario no encontrado")
+    conn.commit(); cur.close(); db_put(conn)
+    return {"status": "ok"}
+
+
+@app.delete("/usuarios-lista/{usuario_id}")
+def eliminar_usuario(usuario_id: int):
+    if not (DATA_MODE == "db" and pool):
+        raise HTTPException(503, "DB no disponible")
+    conn = db_conn(); cur = conn.cursor()
+    cur.execute("UPDATE usuarios SET active = FALSE WHERE id = %s", (usuario_id,))
+    if cur.rowcount == 0:
+        cur.close(); db_put(conn)
+        raise HTTPException(404, "Usuario no encontrado")
+    conn.commit(); cur.close(); db_put(conn)
+    return {"status": "ok"}
+
+
+
 @app.get("/resumen-pagos-completo")
 def resumen_pagos_completo(
     anio: int = Query(...),
