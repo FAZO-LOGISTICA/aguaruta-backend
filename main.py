@@ -1342,6 +1342,101 @@ def resumen_pagos(
 
 
 # ============================================================================
+# ENDPOINT — RESUMEN PAGOS COMPLETO (para exportar Excel/PDF en una sola query)
+# ============================================================================
+@app.get("/resumen-pagos-completo")
+def resumen_pagos_completo(
+    anio: int = Query(...),
+    mes: int = Query(...),
+    camion: Optional[str] = Query(None),
+    dia: Optional[str] = Query(None),
+):
+    if not (DATA_MODE == "db" and pool):
+        raise HTTPException(503, "DB no disponible")
+    conn = db_conn(); cur = conn.cursor()
+
+    mes_str = f"{anio}-{mes:02d}"
+
+    cur.execute("SELECT precio_unitario FROM precios_mes WHERE anio=%s AND mes=%s", (anio, mes))
+    precio_row = cur.fetchone()
+    precio_unitario = float(precio_row[0]) if precio_row else 0
+
+    ent_cond = ["fecha LIKE %s"]; ent_params = [f"{mes_str}%"]
+    if camion: ent_cond.append("camion = %s"); ent_params.append(camion.upper())
+    cur.execute(
+        f"SELECT nombre, COUNT(*) FROM entregas WHERE {' AND '.join(ent_cond)} AND estado IN (1,5,6,7) GROUP BY nombre",
+        ent_params
+    )
+    entregas_map = {row[0].strip().lower(): row[1] for row in cur.fetchall()}
+
+    cur.execute("""
+        SELECT LOWER(TRIM(f.nombre)), COALESCE(SUM(p.monto), 0), f.id
+        FROM familias f
+        LEFT JOIN pagos p ON p.familia_id = f.id AND p.anio = %s AND p.mes = %s
+        GROUP BY f.nombre, f.id
+    """, (anio, mes))
+    pagos_map = {}; famid_map = {}
+    for row in cur.fetchall():
+        pagos_map[row[0]] = float(row[1])
+        famid_map[row[0]] = row[2]
+
+    # Todos los residentes en UNA sola query
+    cur.execute("""
+        SELECT LOWER(TRIM(f.nombre)), r.nombre, r.rut, r.observacion
+        FROM residentes r
+        JOIN familias f ON f.id = r.familia_id
+        WHERE f.activo = TRUE
+        ORDER BY f.nombre, r.id
+    """)
+    residentes_map = {}
+    for row in cur.fetchall():
+        key = row[0]
+        if key not in residentes_map:
+            residentes_map[key] = []
+        residentes_map[key].append({
+            "nombre": row[1],
+            "rut": row[2] or "—",
+            "observacion": row[3] or "—",
+        })
+
+    r_cond = ["1=1"]; r_params = []
+    if camion: r_cond.append("camion = %s"); r_params.append(camion.upper())
+    if dia:    r_cond.append("UPPER(dia) = %s"); r_params.append(dia.upper())
+    cur.execute(
+        f"SELECT id, nombre, camion, litros FROM rutas_activas WHERE {' AND '.join(r_cond)} ORDER BY camion, nombre",
+        r_params
+    )
+    rutas = cur.fetchall()
+    cur.close(); db_put(conn)
+
+    resultado = []
+    for row in rutas:
+        rid, nombre, cam, litros = row
+        nombre_key = nombre.strip().lower()
+        personas = (litros or 700) // 700
+        n_entregas = entregas_map.get(nombre_key, 0)
+        pagado = pagos_map.get(nombre_key, 0.0)
+        fid = famid_map.get(nombre_key, rid)
+        cobro = n_entregas * personas * precio_unitario if precio_unitario > 0 else 0
+        deuda = max(0, cobro - pagado)
+        resultado.append({
+            "id": fid,
+            "nombre": nombre,
+            "camion": cam,
+            "litros": litros or 700,
+            "personas": personas,
+            "entregas_mes": n_entregas,
+            "cobro_calculado": round(cobro, 2),
+            "pagado": round(pagado, 2),
+            "deuda": round(deuda, 2),
+            "estado": "pagado" if deuda <= 0 and cobro > 0 else "moroso" if cobro > 0 else "sin_entregas",
+            "residentes": residentes_map.get(nombre_key, []),
+        })
+
+    return {"familias": resultado, "precio_unitario": precio_unitario}
+
+
+# ============================================================================
 # ENDPOINTS — CIERRE DE MES
 # ============================================================================
 
